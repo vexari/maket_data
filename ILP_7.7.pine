@@ -1,0 +1,162 @@
+//@version=5
+indicator("ILPv7.7", overlay = true, max_labels_count = 500)
+
+// ========================
+// USER INPUTS
+// ========================
+tradeStyle    = input.string("SWEEP", "Trading Style", options = ["DAYTRADE", "SWEEP", "SAVINGS"])
+
+// Settings
+rangeLenBase      = input.int(60, "Range Lookback", minval = 20)
+swingLenBase      = input.int(5,  "Swing Length",   minval = 2)
+dipHighPct        = input.float(0.50, "Dip Zone Cap (EQ)", minval=0.3, maxval=0.8)
+reclaimPctStandard= input.float(0.55, "Standard Reclaim %", minval=0.4, maxval=0.9)
+highConviction    = input.int(6, "High Conviction Score (Fast Track)", minval=4)
+
+// Confirmation
+useRsi   = input.bool(true, "Use RSI")
+rsiLen   = input.int(14, "RSI Len")
+rsiMin   = input.float(40.0, "RSI Min")
+useVol   = input.bool(true, "Use Vol")
+volMult  = input.float(0.8, "Vol Mult")
+
+// ========================
+// CALCULATIONS
+// ========================
+// 1. Dynamic Parameters based on Volatility
+atrRel = ta.atr(14) / close
+isHighVol = atrRel > 0.04
+isLowVol  = atrRel < 0.015
+
+rangeLen = isHighVol ? int(rangeLenBase * 0.7) : (isLowVol ? int(rangeLenBase * 1.3) : rangeLenBase)
+maxDipAge = tradeStyle == "SWEEP" ? 45 : (tradeStyle == "SAVINGS" ? 80 : 15)
+
+// 2. Range & Zones
+rangeLow  = ta.lowest(low, rangeLen)
+rangeHigh = ta.highest(high, rangeLen) // TARGET
+rng       = rangeHigh - rangeLow
+eqLvl     = (rangeLow + rangeHigh) / 2.0
+dipLimit  = rangeLow + (rng * dipHighPct)
+
+// 3. Score Components
+rsiVal = ta.rsi(close, rsiLen)
+rsiOk  = not useRsi or rsiVal > rsiMin
+
+volMa  = ta.sma(volume, 20)
+volOk  = not useVol or volume > volMa * volMult
+
+pLow   = ta.pivotlow(low, swingLenBase, swingLenBase)
+lastSwingLow = ta.valuewhen(not na(pLow), pLow, 0)
+
+bullSweep = not na(lastSwingLow) and low < lastSwingLow and close > lastSwingLow
+recentSweep = ta.barssince(bullSweep) < 20
+
+fvg = (low > high[2] and close > open) or (low[1] > high[3] and close[1] > open[1])
+
+// Dip Memory
+inDip = close <= dipLimit
+var bool wasInDip = false
+wasInDip := inDip ? true : (close > eqLvl * 1.05 ? false : wasInDip) 
+isPrimed = wasInDip and ta.barssince(inDip) < maxDipAge
+
+// 4. THE SCORE
+score = 0
+score += isPrimed ? 2 : 0
+score += recentSweep ? 2 : 0
+score += fvg ? 1 : 0
+score += rsiOk ? 1 : 0
+score += volOk ? 1 : 0
+score += close > ta.ema(close, 200) ? 1 : 0 
+
+// 5. SMART TRIGGER
+activeReclaimPct = score >= highConviction ? 0.50 : reclaimPctStandard 
+triggerLine = rangeLow + (rng * activeReclaimPct)
+
+entrySignal = ta.crossover(close, triggerLine) and score >= 4 and isPrimed
+
+// 6. SMART STOP LOSS (The Fix)
+// Track the absolute lowest point ONLY during the current "Primed" phase.
+var float sessionLow = na
+if isPrimed
+    if not isPrimed[1] // New setup started
+        sessionLow := low
+    else
+        sessionLow := math.min(sessionLow, low) // Update to lowest point found
+else
+    sessionLow := na
+
+// Fallback if sessionLow is missing (safety)
+stopLossLvl = na(sessionLow) ? rangeLow : sessionLow
+
+// 7. R:R CALCULATION
+risk    = close - stopLossLvl
+reward  = rangeHigh - close
+rrRatio = risk > 0 ? (reward / risk) : 0
+
+// ========================
+// VISUALS
+// ========================
+// Plot Trigger (Blue)
+plot(isPrimed ? triggerLine : na, "Trigger Line", color=color.new(color.blue, 0), style=plot.style_linebr, linewidth=2)
+
+// Plot Target (White Circles)
+plot(isPrimed or entrySignal ? rangeHigh : na, "Target Liquidity", color=color.new(color.white, 10), style=plot.style_circles, linewidth=2)
+
+// Plot Stop Loss (Red Cross)
+plot(isPrimed ? stopLossLvl : na, "Invalidation", color=color.new(color.red, 0), style=plot.style_cross, linewidth=1)
+
+// Background
+bgcolor(entrySignal ? color.new(color.green, 85) : (isPrimed and score >= 4 ? color.new(color.yellow, 95) : na))
+
+// Entry Label
+plotshape(entrySignal, title="ENTRY", style=shape.labelup, color=color.green, textcolor=color.white, size=size.small, location=location.belowbar, text="FLY\nGO")
+
+// Dashboard
+var table dash = table.new(position.top_right, 2, 8, border_width = 1)
+if barstate.islast
+    // Header
+    table.cell(dash, 0, 0, "ILPv7.7", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 0, syminfo.ticker, bgcolor=color.black, text_color=color.white)
+    
+    // Status
+    statusTxt = entrySignal ? "TRIGGERED" : (isPrimed ? "STALKING" : "SCANNING")
+    statusCol = entrySignal ? color.green : (isPrimed ? color.yellow : color.gray)
+    table.cell(dash, 0, 1, "Status", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 1, statusTxt, bgcolor=statusCol, text_color=color.black)
+    
+    // Score
+    scoreCol = score >= highConviction ? color.aqua : (score >= 4 ? color.green : color.red)
+    table.cell(dash, 0, 2, "Score", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 2, str.tostring(score) + (score >= highConviction ? " (High)" : ""), bgcolor=scoreCol, text_color=color.black)
+    
+    // Trigger
+    table.cell(dash, 0, 3, "Trigger @", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 3, str.tostring(triggerLine, "#.##"), bgcolor=color.blue, text_color=color.white)
+
+    // Stop Loss
+    table.cell(dash, 0, 4, "Stop Loss", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 4, str.tostring(stopLossLvl, "#.##"), bgcolor=color.red, text_color=color.white)
+
+    // Target
+    table.cell(dash, 0, 5, "Target @", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 5, str.tostring(rangeHigh, "#.##"), bgcolor=color.black, text_color=color.white)
+
+    // Distance
+    dist = ((triggerLine - close) / close) * 100
+    distTxt = dist > 0 ? "+" + str.tostring(dist, "#.1") + "%" : "CLEARED"
+    table.cell(dash, 0, 6, "To Trigger", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 6, distTxt, bgcolor=color.black, text_color=color.white)
+
+    // R:R
+    rrColor = rrRatio >= 3.0 ? color.green : (rrRatio >= 2.0 ? color.yellow : color.red)
+    table.cell(dash, 0, 7, "R:R Ratio", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 7, str.tostring(rrRatio, "#.1") + " R", bgcolor=rrColor, text_color=color.black)
+
+// ========================
+// ALERTS
+// ========================
+alertcondition(entrySignal, title="FLY: EXECUTE ENTRY", message="FLY ENTRY TRIGGERED")
+
+if entrySignal
+    alertMsg = str.format("{0} ENTRY | Price: {1} | Stop: {2} | Target: {3} | R:R: {4}", syminfo.ticker, close, stopLossLvl, rangeHigh, rrRatio)
+    alert(alertMsg, alert.freq_once_per_bar_close)

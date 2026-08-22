@@ -1,1 +1,3 @@
-AMZN, BMNR, BOTZ, BSEN, ETHA, FIBI, HACK, IBIT, KRE, NVDA, ORBI, PANW, PLTR, POLI, SCHG, SMH, URA, VTWO, XBI, XLE, XLF, XLI, XLK
+# Corrected for Yahoo Finance (2026-08-22): TASE tickers need a .TA suffix.
+# Removed: ORBI -- no Yahoo Finance data found under any symbol tried.
+AMZN, BMNR, BOTZ, BSEN.TA, ETHA, FIBI.TA, HACK, IBIT, KRE, NVDA, PANW, PLTR, POLI.TA, SCHG, SMH, URA, VTWO, XBI, XLE, XLF, XLI, XLK

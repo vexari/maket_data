@@ -83,7 +83,10 @@ def read_tickers(args: argparse.Namespace) -> List[str]:
     if args.input_file:
         with open(args.input_file, "r", encoding="utf-8") as f:
             for line in f:
-                for part in _SPLIT_RE.split(line.strip()):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue  # whole-line comment
+                for part in _SPLIT_RE.split(line):
                     nt = _normalize_token(part)
                     if nt:
                         tokens.append(nt)
@@ -229,6 +232,22 @@ def fetch_one(ticker: str, start: str, end: str, interval: str, adjust: bool,
                                auto_adjust=False, actions=True, raise_errors=False)
                 if df is None or df.empty:
                     return ticker, None, f"No data returned (interval={interval})."
+            if not df.empty:
+                # A ticker code can coincidentally match an unrelated (often
+                # delisted/thin) instrument on another exchange. That doesn't
+                # raise an error -- Yahoo just returns stale data -- so flag
+                # it here: if the latest bar is far older than requested,
+                # this is very likely the wrong symbol (needs a suffix like
+                # .TA/.KS, or a hyphenated share class like BRK-B).
+                try:
+                    last_dt = df.index.max()
+                    end_ts = pd.Timestamp(end)
+                    if pd.notna(last_dt) and (end_ts - last_dt.tz_localize(None)).days > 30:
+                        log(f"[warn] {ticker}: latest bar is {last_dt.date()}, well before "
+                            f"requested end {end} — likely the wrong symbol (delisted, or "
+                            f"matching an unrelated ticker on another exchange).")
+                except Exception:
+                    pass
             if adjust:
                 df = _adjust_close(df)
             cols = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits"]
@@ -361,23 +380,38 @@ def _run(args: argparse.Namespace):
         for t in tickers:
             limiter.wait()
             try:
-                dfv = yf.Ticker(t, session=_get_session()).history(
-                    period="5d", interval="1d", auto_adjust=False, actions=False, raise_errors=False)
+                tk = yf.Ticker(t, session=_get_session())
+                dfv = tk.history(period="5d", interval="1d", auto_adjust=False,
+                                  actions=False, raise_errors=False)
                 if dfv is not None and not dfv.empty:
-                    valid.append(t)
+                    # Surface the resolved company/exchange so a ticker that
+                    # coincidentally matches the WRONG instrument (e.g. a
+                    # bare TASE mnemonic hitting an unrelated US micro-cap)
+                    # is visible here, before it silently pollutes a download.
+                    name, exch = "", ""
+                    try:
+                        info = tk.get_info()
+                        name = info.get("shortName") or info.get("longName") or ""
+                        exch = info.get("exchange") or info.get("fullExchangeName") or ""
+                    except Exception:
+                        pass
+                    valid.append((t, name, exch))
                 else:
                     invalid.append((t, "empty"))
             except Exception as e:
                 invalid.append((t, str(e)))
         with open("valid_tickers.txt", "w", encoding="utf-8") as f:
-            f.write("\n".join(sorted(valid)) + ("\n" if valid else ""))
+            for t, name, exch in sorted(valid):
+                f.write(f"{t}\t{name}\t{exch}\n" if (name or exch) else f"{t}\n")
         with open("invalid_tickers.txt", "w", encoding="utf-8") as f:
             for t, msg in sorted(invalid):
                 f.write(f"{t}\t{msg}\n")
-        log(f"[info] wrote valid_tickers.txt ({len(valid)}) and invalid_tickers.txt ({len(invalid)})")
+        log(f"[info] wrote valid_tickers.txt ({len(valid)}) and invalid_tickers.txt ({len(invalid)}) "
+            f"-- check the name/exchange columns in valid_tickers.txt for symbols that "
+            f"resolved to an unexpected company (wrong-exchange collision).")
         if args.exit_after_validate:
             return
-        tickers = sorted(valid)
+        tickers = sorted(t for t, _, _ in valid)
         if not tickers:
             log("[err] no valid tickers to download after validation.")
             return

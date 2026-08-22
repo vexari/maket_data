@@ -1,1 +1,4 @@
-ESLT, BSEN, NXSN, ORBI
+# Corrected for Yahoo Finance (2026-08-22): TASE tickers need a .TA suffix
+# (ESLT is Elbit Systems' direct Nasdaq listing, so no suffix there).
+# Removed: ORBI -- no Yahoo Finance data found under any symbol tried.
+ESLT, BSEN.TA, NXSN.TA

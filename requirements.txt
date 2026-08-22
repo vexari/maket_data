@@ -1,0 +1,7 @@
+yfinance==0.2.65
+pandas==2.3.2
+pyarrow==21.0.0
+# Browser-impersonating HTTP client. Strongly recommended: without it,
+# get_stock_data.py falls back to yfinance's default session, which Yahoo
+# is much more likely to rate-limit or block.
+curl_cffi==0.13.0

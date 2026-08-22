@@ -5,3 +5,7 @@ pyarrow==21.0.0
 # get_stock_data.py falls back to yfinance's default session, which Yahoo
 # is much more likely to rate-limit or block.
 curl_cffi==0.13.0
+# Only needed for --source ibkr (pulls data from a running TWS/IB Gateway
+# instead of Yahoo). Safe to skip if you're only using the default yfinance
+# source -- the script degrades gracefully with a clear error if missing.
+ib_async==2.1.0

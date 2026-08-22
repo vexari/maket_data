@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 get_stock_data.py
-Download historical OHLCV data for many tickers via yfinance.
+Download historical OHLCV data for many tickers via yfinance, or via
+Interactive Brokers (--source ibkr) as an alternative data source.
 
 Modes for existing outputs:
   (default) skip existing (and don't even re-download them)
@@ -19,9 +20,21 @@ Reliability:
   - Retries use exponential backoff with jitter; rate-limit errors get a
     longer backoff than other transient errors.
 
+IBKR source (--source ibkr):
+  Pulls bars from a running TWS or IB Gateway instance instead of Yahoo, via
+  the ib_async package (pip install ib_async). Requires TWS/IB Gateway to be
+  running, logged in, with API access enabled (File > Global Configuration >
+  API > Settings > Enable ActiveX and Socket Clients) and market data
+  permissions for the exchanges you're requesting. See --ib-host/--ib-port/
+  --ib-client-id. Tickers use this tool's Yahoo-style format (AAPL, BSEN.TA,
+  BTC-USD, ^GSPC, ...) and are translated to IB contracts on a best-effort
+  basis (see _ib_contract_for) -- some formats (indices in particular) may
+  need the raw IB symbol instead of the Yahoo one.
+
 Examples:
   python get_stock_data.py -i tickers.list -s 2019-01-01 -I 1d --include-today
   python get_stock_data.py -i tickers.list --append
+  python get_stock_data.py -i tickers.list --source ibkr --ib-port 7496
 """
 
 import argparse
@@ -51,6 +64,11 @@ try:
 except ImportError:  # older yfinance without a dedicated rate-limit exception
     class YFRateLimitError(Exception):
         pass
+
+try:
+    from ib_async import IB, Stock, Crypto, Index, Contract
+except ImportError:
+    IB = None  # only required when --source ibkr is used
 
 _log_file_handle = None  # set in main() when --log-file is given
 
@@ -272,6 +290,121 @@ def fetch_one(ticker: str, start: str, end: str, interval: str, adjust: bool,
                 return ticker, None, last_err
     return ticker, None, last_err
 
+# ---------- IBKR (Interactive Brokers) source ----------
+# Alternative to yfinance: pulls bars from a running TWS/IB Gateway instance
+# over its local API socket via ib_async. This is your own broker connection
+# (not scraping Yahoo), so it isn't subject to Yahoo's rate-limiting, and it
+# can reach some symbols Yahoo has no data for -- but it needs TWS/IB Gateway
+# running and logged in, with API access enabled and market data permissions
+# for the relevant exchanges.
+
+# yfinance-style interval -> IB barSizeSetting. A few yfinance intervals have
+# no clean IB equivalent and are simply unsupported here (90m, 5d, 3mo).
+_IB_BAR_SIZE = {
+    "1m": "1 min", "2m": "2 mins", "5m": "5 mins", "15m": "15 mins",
+    "30m": "30 mins", "60m": "1 hour", "1h": "1 hour",
+    "1d": "1 day", "1wk": "1 week", "1mo": "1 month",
+}
+
+# Conservative per-request duration so a single reqHistoricalData call stays
+# comfortably inside IB's pacing/size limits for that bar size; fetch_one_ibkr
+# pages backward in chunks this size until it covers the requested start date.
+_IB_CHUNK_DURATION = {
+    "1 min": "1 D", "2 mins": "2 D", "5 mins": "5 D", "15 mins": "10 D",
+    "30 mins": "20 D", "1 hour": "30 D",
+    "1 day": "1 Y", "1 week": "5 Y", "1 month": "10 Y",
+}
+
+# Yahoo-style suffix -> (IB exchange, currency). Bare symbols (no suffix)
+# are treated as US stocks/ETFs on IB's SMART router. Extend this for other
+# exchanges as needed -- it only covers what this tool's own ticker lists use
+# plus a few common ones.
+_IB_SUFFIX_MAP = {
+    ".TA": ("TASE", "ILS"), ".KS": ("KSE", "KRW"), ".KQ": ("KOSDAQ", "KRW"),
+    ".L": ("LSE", "GBP"), ".DE": ("IBIS", "EUR"), ".PA": ("SBF", "EUR"),
+    ".HK": ("SEHK", "HKD"), ".TO": ("TSE", "CAD"), ".AX": ("ASX", "AUD"),
+}
+
+def _ib_contract_for(ticker: str) -> "Contract":
+    """Best-effort translation of one of this tool's Yahoo-style tickers into
+    an IB contract. Indices in particular don't map 1:1 (Yahoo's ^GSPC vs
+    IB's SPX) -- for those you may need to pass IB's own symbol directly."""
+    if ticker.endswith("-USD"):
+        return Crypto(ticker[:-4], "PAXOS", "USD")
+    if ticker.startswith("^"):
+        return Index(ticker[1:], "CBOE", "USD")
+    for suffix, (exch, ccy) in _IB_SUFFIX_MAP.items():
+        if ticker.endswith(suffix):
+            return Stock(ticker[: -len(suffix)], exch, ccy)
+    return Stock(ticker, "SMART", "USD")
+
+def fetch_one_ibkr(ib: "IB", ticker: str, start: str, end: str, interval: str,
+                    adjust: bool, limiter: "RateLimiter"
+                    ) -> Tuple[str, Optional[pd.DataFrame], Optional[str]]:
+    bar_size = _IB_BAR_SIZE.get(interval)
+    if bar_size is None:
+        return ticker, None, f"interval={interval} has no IBKR equivalent (try 1d/1h/1wk/1mo/etc.)"
+
+    contract = _ib_contract_for(ticker)
+    try:
+        limiter.wait()
+        qualified = ib.qualifyContracts(contract)
+    except Exception as e:
+        return ticker, None, f"IBKR contract qualification failed: {e}"
+    if not qualified or not qualified[0].conId:
+        return ticker, None, f"IBKR could not resolve a contract for {ticker!r} ({contract})"
+    contract = qualified[0]
+
+    start_ts = pd.Timestamp(start)
+    end_dt = pd.Timestamp(end).to_pydatetime()
+    chunk = _IB_CHUNK_DURATION.get(bar_size, "1 Y")
+    what_to_show = "ADJUSTED_LAST" if adjust else "TRADES"
+
+    all_bars, seen_dates = [], set()
+    cursor = end_dt
+    for _ in range(200):  # hard safety cap on paged requests per ticker
+        limiter.wait()
+        try:
+            bars = ib.reqHistoricalData(
+                contract, endDateTime=cursor, durationStr=chunk,
+                barSizeSetting=bar_size, whatToShow=what_to_show, useRTH=True,
+            )
+        except Exception as e:
+            return ticker, None, f"IBKR historical data request failed: {e}"
+        new_bars = [b for b in bars if b.date not in seen_dates]
+        if not new_bars:
+            break
+        seen_dates.update(b.date for b in new_bars)
+        all_bars.extend(new_bars)
+        earliest_ts = pd.Timestamp(min(b.date for b in new_bars))
+        if earliest_ts.tzinfo is not None:
+            earliest_ts = earliest_ts.tz_localize(None)
+        if earliest_ts <= start_ts:
+            break
+        cursor = earliest_ts.to_pydatetime()
+
+    if not all_bars:
+        return ticker, None, "No data returned from IBKR."
+
+    df = pd.DataFrame({
+        "Open": [b.open for b in all_bars],
+        "High": [b.high for b in all_bars],
+        "Low": [b.low for b in all_bars],
+        "Close": [b.close for b in all_bars],
+        "Volume": [b.volume for b in all_bars],
+    }, index=pd.to_datetime([b.date for b in all_bars]))
+    df.index.name = "Date"
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    df = df[(df.index >= start_ts) & (df.index <= pd.Timestamp(end_dt))]
+    if df.empty:
+        return ticker, None, "No data in requested range from IBKR."
+    return ticker, df, None
+
+def ib_connect(host: str, port: int, client_id: int) -> "IB":
+    ib = IB()
+    ib.connect(host, port, clientId=client_id, timeout=10)
+    return ib
+
 # ---------- interval range sanity check ----------
 # Approximate limits Yahoo enforces on intraday history (days of lookback).
 _INTRADAY_LIMIT_DAYS = {
@@ -304,7 +437,21 @@ def parse_args() -> argparse.Namespace:
                    help="Interval. Default: 1d")
     p.add_argument("-o", "--outdir", default="history", help="Output directory. Default: ./history")
     p.add_argument("-f", "--format", default="csv", choices=["csv", "parquet"], help="Output format.")
-    p.add_argument("--adjust", action="store_true", help="Rescale OHLC so Close equals Adj Close.")
+    p.add_argument("--source", choices=["yfinance", "ibkr"], default="yfinance",
+                   help="Market data backend. 'ibkr' pulls from a running TWS/IB Gateway "
+                        "instead of Yahoo -- see --ib-* options. Default: yfinance")
+    p.add_argument("--ib-host", default="127.0.0.1", help="TWS/IB Gateway host. Default: 127.0.0.1")
+    p.add_argument("--ib-port", type=int, default=7496,
+                   help="TWS/IB Gateway API port. Default: 7496 (TWS live). "
+                        "Common values: 7497 TWS paper, 4001 IB Gateway live, 4002 IB Gateway paper.")
+    p.add_argument("--ib-client-id", type=int, default=42,
+                   help="IB API client id. Must be unique among concurrent API connections. Default: 42")
+    p.add_argument("--ib-rate-limit", type=float, default=2.0,
+                   help="Max historical-data requests/sec to IBKR (separate from --rate-limit, "
+                        "which only applies to yfinance). Default: 2.0")
+    p.add_argument("--adjust", action="store_true",
+                   help="yfinance: rescale OHLC so Close equals Adj Close. "
+                        "ibkr: request split/dividend-adjusted bars (ADJUSTED_LAST) instead of raw TRADES.")
     p.add_argument("--threads", type=int, default=min(8, os.cpu_count() or 4), help="Concurrency.")
     p.add_argument("--retries", type=int, default=3, help="Retry count.")
     p.add_argument("--sleep", type=float, default=0.5, help="Base seconds for retry backoff.")
@@ -371,35 +518,78 @@ def _run(args: argparse.Namespace):
 
     limiter = RateLimiter(args.rate_limit)
 
+    ib = None
+    if args.source == "ibkr":
+        if IB is None:
+            log("[err] --source ibkr requires the 'ib_async' package: pip install ib_async")
+            return
+        try:
+            ib = ib_connect(args.ib_host, args.ib_port, args.ib_client_id)
+        except Exception as e:
+            log(f"[err] Could not connect to TWS/IB Gateway at {args.ib_host}:{args.ib_port} -- {e}")
+            log("      Make sure TWS or IB Gateway is running, logged in, and API access is enabled "
+                "(File > Global Configuration > API > Settings > Enable ActiveX and Socket Clients).")
+            return
+        log(f"[info] connected to IBKR at {args.ib_host}:{args.ib_port} (clientId={args.ib_client_id})")
+        limiter = RateLimiter(args.ib_rate_limit)  # IB's own pacing is unrelated to Yahoo's
+
+    try:
+        _run_with_source(args, tickers, limiter, ib)
+    finally:
+        if ib is not None:
+            ib.disconnect()
+
+def _run_with_source(args: argparse.Namespace, tickers: List[str],
+                      limiter: "RateLimiter", ib: Optional["IB"]) -> None:
     # validation
     if args.validate:
         log(f"[info] validating {len(tickers)} tickers ...")
         valid, invalid = [], []
-        # sequential (not threaded) to keep well under the rate limit while
-        # still sharing the same limiter/session as the main download pass
-        for t in tickers:
-            limiter.wait()
-            try:
-                tk = yf.Ticker(t, session=_get_session())
-                dfv = tk.history(period="5d", interval="1d", auto_adjust=False,
-                                  actions=False, raise_errors=False)
-                if dfv is not None and not dfv.empty:
-                    # Surface the resolved company/exchange so a ticker that
-                    # coincidentally matches the WRONG instrument (e.g. a
-                    # bare TASE mnemonic hitting an unrelated US micro-cap)
-                    # is visible here, before it silently pollutes a download.
-                    name, exch = "", ""
+        if args.source == "ibkr":
+            for t in tickers:
+                limiter.wait()
+                try:
+                    contract = _ib_contract_for(t)
+                    qualified = ib.qualifyContracts(contract)
+                    if not qualified or not qualified[0].conId:
+                        invalid.append((t, "IBKR could not resolve a contract"))
+                        continue
+                    name = ""
                     try:
-                        info = tk.get_info()
-                        name = info.get("shortName") or info.get("longName") or ""
-                        exch = info.get("exchange") or info.get("fullExchangeName") or ""
+                        details = ib.reqContractDetails(qualified[0])
+                        if details:
+                            name = details[0].longName or ""
                     except Exception:
                         pass
-                    valid.append((t, name, exch))
-                else:
-                    invalid.append((t, "empty"))
-            except Exception as e:
-                invalid.append((t, str(e)))
+                    valid.append((t, name, qualified[0].exchange or ""))
+                except Exception as e:
+                    invalid.append((t, str(e)))
+        else:
+            # sequential (not threaded) to keep well under the rate limit while
+            # still sharing the same limiter/session as the main download pass
+            for t in tickers:
+                limiter.wait()
+                try:
+                    tk = yf.Ticker(t, session=_get_session())
+                    dfv = tk.history(period="5d", interval="1d", auto_adjust=False,
+                                      actions=False, raise_errors=False)
+                    if dfv is not None and not dfv.empty:
+                        # Surface the resolved company/exchange so a ticker that
+                        # coincidentally matches the WRONG instrument (e.g. a
+                        # bare TASE mnemonic hitting an unrelated US micro-cap)
+                        # is visible here, before it silently pollutes a download.
+                        name, exch = "", ""
+                        try:
+                            info = tk.get_info()
+                            name = info.get("shortName") or info.get("longName") or ""
+                            exch = info.get("exchange") or info.get("fullExchangeName") or ""
+                        except Exception:
+                            pass
+                        valid.append((t, name, exch))
+                    else:
+                        invalid.append((t, "empty"))
+                except Exception as e:
+                    invalid.append((t, str(e)))
         with open("valid_tickers.txt", "w", encoding="utf-8") as f:
             for t, name, exch in sorted(valid):
                 f.write(f"{t}\t{name}\t{exch}\n" if (name or exch) else f"{t}\n")
@@ -416,7 +606,8 @@ def _run(args: argparse.Namespace):
             log("[err] no valid tickers to download after validation.")
             return
 
-    warn_intraday_range(args.interval, args.start, args.end)
+    if args.source == "yfinance":
+        warn_intraday_range(args.interval, args.start, args.end)
 
     # Decide per-ticker what to do *before* downloading anything:
     #  - default mode: if the output already exists, don't fetch it at all.
@@ -453,18 +644,26 @@ def _run(args: argparse.Namespace):
     for t in skipped:
         log(f"[skip] {t}: output file already exists -> {os.path.join(args.outdir, f'{t}.{args.format}')}")
 
-    log(f"[info] downloading {len(tickers_to_fetch)} tickers @ {args.interval} "
-        f"({len(skipped)} skipped, already exist; rate-limited to {args.rate_limit or 'unlimited'} req/s)")
+    log(f"[info] downloading {len(tickers_to_fetch)} tickers via {args.source} @ {args.interval} "
+        f"({len(skipped)} skipped, already exist)")
 
     results = []
-    with cf.ThreadPoolExecutor(max_workers=max(1, args.threads)) as ex:
-        futures = [
-            ex.submit(fetch_one, t, fetch_plan[t][0], args.end, args.interval,
-                      args.adjust, args.retries, args.sleep, limiter)
-            for t in tickers_to_fetch
-        ]
-        for fut in cf.as_completed(futures):
-            results.append(fut.result())
+    if args.source == "ibkr":
+        # IB uses one shared socket connection (clientId) -- pace requests
+        # sequentially through it rather than hammering it from a thread
+        # pool the way the independent yfinance HTTP sessions can be.
+        for t in tickers_to_fetch:
+            results.append(fetch_one_ibkr(ib, t, fetch_plan[t][0], args.end, args.interval,
+                                           args.adjust, limiter))
+    else:
+        with cf.ThreadPoolExecutor(max_workers=max(1, args.threads)) as ex:
+            futures = [
+                ex.submit(fetch_one, t, fetch_plan[t][0], args.end, args.interval,
+                          args.adjust, args.retries, args.sleep, limiter)
+                for t in tickers_to_fetch
+            ]
+            for fut in cf.as_completed(futures):
+                results.append(fut.result())
 
     successes, failures = 0, []
     os.makedirs(args.outdir, exist_ok=True)

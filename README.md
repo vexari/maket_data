@@ -1,16 +1,17 @@
 # get_stock_data
 
-A flexible Python tool to download **historical OHLCV stock/ETF/index data** from [Yahoo Finance](https://finance.yahoo.com/) using [yfinance](https://github.com/ranaroussi/yfinance).
+A flexible Python tool to download **historical OHLCV stock/ETF/index data**, from [Yahoo Finance](https://finance.yahoo.com/) via [yfinance](https://github.com/ranaroussi/yfinance) (default) or from **Interactive Brokers** via [ib_async](https://github.com/ib-api-reloaded/ib_async) (`--source ibkr`).
 
 - Supports **multiple tickers** from command line or file  
 - Safe handling of existing files: **skip**, **overwrite**, or **append/merge**  
 - Robust ticker parsing (`AAPL`, `$TSLA`, `^GSPC`, `RY.TO`, `EURUSD=X`, etc.)  
 - Includes **today’s bar** with `--include-today` (Yahoo `end` is exclusive)  
 - Parallel downloads with retries and a shared **rate limiter** (`--rate-limit`) to avoid Yahoo throttling/blocks  
+- **`--source ibkr`**: pull bars from your own TWS/IB Gateway connection instead of Yahoo  
 - **Incremental `--append`**: only re-fetches a small trailing window per ticker instead of full history  
 - Skip mode doesn't even download tickers whose output already exists  
 - Export as **CSV** or **Parquet**  
-- Preflight **validation** (`--validate`) to separate valid/invalid tickers  
+- Preflight **validation** (`--validate`) to separate valid/invalid tickers, showing each ticker's resolved company name and exchange  
 - Optional `--log-file` for timestamped logs (handy for cron)  
 
 ---
@@ -80,6 +81,42 @@ python get_stock_data.py -i tickers.list --rate-limit 3   # default: 3 req/s, 0 
 If you hit persistent rate-limit errors, lower `--rate-limit` and/or `--threads` rather than
 raising `--retries`.
 
+### Alternative source: Interactive Brokers
+
+`--source ibkr` pulls bars from a running **TWS** or **IB Gateway** instance over its local API
+socket (via `ib_async`) instead of scraping Yahoo. This is your own broker connection, so it isn't
+subject to Yahoo's rate-limiting, and it can reach some symbols/exchanges Yahoo has no data for.
+
+**Requirements:**
+- TWS or IB Gateway running and **logged in**
+- API access enabled: *File → Global Configuration → API → Settings → Enable ActiveX and Socket Clients*
+- Market data subscriptions for whatever exchanges you're requesting
+
+```bash
+python get_stock_data.py -i tickers.list --source ibkr --ib-port 7496
+```
+
+- `--ib-host` : TWS/IB Gateway host. Default: `127.0.0.1`
+- `--ib-port` : API port. Default: `7496` (TWS live). Other common ports: `7497` TWS paper,
+  `4001` IB Gateway live, `4002` IB Gateway paper
+- `--ib-client-id` : API client id — must be unique among concurrent API connections. Default: `42`
+- `--ib-rate-limit` : max historical-data requests/sec over the IB connection (separate from
+  `--rate-limit`, which only applies to yfinance). Default: `2.0`
+- `--adjust` : with `--source ibkr`, requests split/dividend-adjusted bars (`ADJUSTED_LAST`)
+  instead of raw `TRADES`, rather than yfinance's post-hoc rescaling
+
+Tickers use this tool's normal Yahoo-style format and get translated to IB contracts on a
+best-effort basis: `.TA` → TASE, `.KS`/`.KQ` → Korea, `.L`/`.DE`/`.PA`/`.HK`/`.TO`/`.AX` → their
+respective exchanges, `BTC-USD`-style pairs → IB crypto contracts, a bare symbol → a US stock/ETF
+on IB's SMART router. **Indices are the main exception** — Yahoo's `^GSPC`/`^VIX`-style symbols
+don't match IB's own index symbols (`SPX`, `VIX`), so those may need to be entered directly in IB's
+symbol form. IBKR output has `Open/High/Low/Close/Volume` only — no `Adj Close`/`Dividends`/`Stock
+Splits` columns (those are yfinance-specific).
+
+Because IB uses a single persistent API connection rather than independent HTTP requests, `--source
+ibkr` downloads sequentially through that one connection (not via `--threads`) and pages long date
+ranges backward in chunks automatically.
+
 ### Validation
 
 Check which tickers are valid before download:
@@ -95,7 +132,8 @@ This creates two files:
 ### Other options
 
 - `--print-tickers` : print parsed tickers and exit  
-- `--adjust` : rescale OHLC so Close = Adjusted Close  
+- `--source {yfinance,ibkr}` : market data backend, see [Alternative source: Interactive Brokers](#alternative-source-interactive-brokers). Default: `yfinance`  
+- `--adjust` : rescale OHLC so Close = Adjusted Close (yfinance) / request adjusted bars (ibkr)  
 - `--threads 8` : set concurrency  
 - `--rate-limit 3` : max requests/sec to Yahoo, shared across all threads (0 = unlimited)  
 - `--format parquet` : save in Parquet instead of CSV  

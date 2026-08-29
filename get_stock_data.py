@@ -26,10 +26,8 @@ IBKR source (--source ibkr):
   running, logged in, with API access enabled (File > Global Configuration >
   API > Settings > Enable ActiveX and Socket Clients) and market data
   permissions for the exchanges you're requesting. See --ib-host/--ib-port/
-  --ib-client-id. Tickers use this tool's Yahoo-style format (AAPL, BSEN.TA,
-  BTC-USD, ^GSPC, ...) and are translated to IB contracts on a best-effort
-  basis (see _ib_contract_for) -- some formats (indices in particular) may
-  need the raw IB symbol instead of the Yahoo one.
+  --ib-client-id. Explicit mappings resolve index aliases; all resolved
+  contracts require one unambiguous non-zero conId before collection.
 
 Examples:
   python get_stock_data.py -i tickers.list -s 2019-01-01 -I 1d --include-today
@@ -40,13 +38,19 @@ Examples:
 import argparse
 import concurrent.futures as cf
 import datetime as dt
+import hashlib
+import json
 import os
 import random
 import re
 import sys
+import tempfile
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -66,9 +70,12 @@ except ImportError:  # older yfinance without a dedicated rate-limit exception
         pass
 
 try:
-    from ib_async import IB, Stock, Crypto, Index, Contract
+    from ib_async import IB, Contract, RequestError, StartupFetchNONE
 except ImportError:
     IB = None  # only required when --source ibkr is used
+    Contract = Any
+    RequestError = Exception
+    StartupFetchNONE = None
 
 _log_file_handle = None  # set in main() when --log-file is given
 
@@ -124,12 +131,131 @@ def read_tickers(args: argparse.Namespace) -> List[str]:
     return out
 
 # ---------- IO helpers ----------
-def save_frame(df: pd.DataFrame, path: str, fmt: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+_METADATA_SCHEMA_VERSION = 1
+
+def _metadata_path(path: str) -> str:
+    return f"{path}.meta.json"
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+def _write_frame(df: pd.DataFrame, path: str, fmt: str) -> None:
     if fmt == "csv":
         df.to_csv(path, index=True)
     else:
         df.to_parquet(path, index=True)
+
+def save_frame_with_metadata(
+    df: pd.DataFrame, path: str, fmt: str, metadata: Dict[str, Any]
+) -> None:
+    """Replace data then metadata; interrupted replacement is detected by SHA."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    data_fd, data_tmp = tempfile.mkstemp(prefix=".market-data-", dir=directory)
+    meta_fd, meta_tmp = tempfile.mkstemp(prefix=".market-meta-", dir=directory)
+    os.close(data_fd)
+    os.close(meta_fd)
+    try:
+        _write_frame(df, data_tmp, fmt)
+        complete = dict(metadata)
+        complete["data_sha256"] = _sha256_file(data_tmp)
+        with open(meta_tmp, "w", encoding="utf-8") as handle:
+            json.dump(complete, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(data_tmp, path)
+        os.replace(meta_tmp, _metadata_path(path))
+    finally:
+        for temporary in (data_tmp, meta_tmp):
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+def load_and_validate_metadata(
+    path: str,
+    *,
+    source: str,
+    ticker: str,
+    interval: str,
+    adjusted: bool,
+    ib_use_rth: bool,
+    what_to_show: Optional[str] = None,
+) -> Dict[str, Any]:
+    sidecar = _metadata_path(path)
+    if not os.path.exists(sidecar):
+        raise ValueError(
+            f"legacy output has no trusted provenance: {sidecar}; "
+            "use --overwrite once to establish metadata"
+        )
+    try:
+        with open(sidecar, "r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid provenance metadata for {path}: {exc}") from exc
+    expected = {
+        "schema_version": _METADATA_SCHEMA_VERSION,
+        "source": source,
+        "requested_ticker": ticker,
+        "interval": interval,
+        "adjusted": adjusted,
+    }
+    for key, value in expected.items():
+        if metadata.get(key) != value:
+            raise ValueError(
+                f"provenance mismatch for {path}: {key} is "
+                f"{metadata.get(key)!r}, expected {value!r}"
+            )
+    actual_sha = _sha256_file(path)
+    if metadata.get("data_sha256") != actual_sha:
+        raise ValueError(f"provenance SHA-256 mismatch for {path}")
+    if source == "ibkr":
+        ibkr = metadata.get("ibkr")
+        if not isinstance(ibkr, dict):
+            raise ValueError(f"IBKR provenance block missing for {path}")
+        if ibkr.get("useRTH") is not ib_use_rth:
+            raise ValueError(f"IBKR useRTH provenance mismatch for {path}")
+        if ibkr.get("whatToShow") != what_to_show:
+            raise ValueError(f"IBKR whatToShow provenance mismatch for {path}")
+        if not isinstance(ibkr.get("conId"), int) or ibkr["conId"] == 0:
+            raise ValueError(f"IBKR provenance has invalid conId for {path}")
+    return metadata
+
+def _base_metadata(args: argparse.Namespace, ticker: str) -> Dict[str, Any]:
+    return {
+        "schema_version": _METADATA_SCHEMA_VERSION,
+        "source": args.source,
+        "requested_ticker": ticker,
+        "interval": args.interval,
+        "adjusted": args.adjust,
+        "requested_start": args.start,
+        "requested_end": args.end,
+        "fetched_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "data_sha256": "",
+        "time_semantics": (
+            "calendar_date" if _is_calendar_interval(args.interval) else "utc_instant"
+        ),
+        "ibkr": None,
+    }
+
+def output_path(args: argparse.Namespace, ticker: str) -> str:
+    directory = os.path.join(args.outdir, "ibkr") if args.source == "ibkr" else args.outdir
+    return os.path.join(directory, f"{ticker}.{args.format}")
+
+def validate_ib_append_identity(
+    existing_metadata: Dict[str, Any], fetched_metadata: Dict[str, Any]
+) -> None:
+    existing = existing_metadata["ibkr"]["conId"]
+    resolved = fetched_metadata["ibkr"]["conId"]
+    if existing != resolved:
+        raise ValueError(
+            f"IBKR conId provenance mismatch: existing={existing}, resolved={resolved}"
+        )
 
 def load_existing(path: str, fmt: str) -> Optional[pd.DataFrame]:
     if not os.path.exists(path):
@@ -306,9 +432,8 @@ _IB_BAR_SIZE = {
     "1d": "1 day", "1wk": "1 week", "1mo": "1 month",
 }
 
-# Conservative per-request duration so a single reqHistoricalData call stays
-# comfortably inside IB's pacing/size limits for that bar size; fetch_one_ibkr
-# pages backward in chunks this size until it covers the requested start date.
+# Operational page sizes, deliberately conservative and locally bounded. They
+# are not represented as official IBKR limits.
 _IB_CHUNK_DURATION = {
     "1 min": "1 D", "2 mins": "2 D", "5 mins": "5 D", "15 mins": "10 D",
     "30 mins": "20 D", "1 hour": "30 D",
@@ -325,85 +450,302 @@ _IB_SUFFIX_MAP = {
     ".HK": ("SEHK", "HKD"), ".TO": ("TSE", "CAD"), ".AX": ("ASX", "AUD"),
 }
 
-def _ib_contract_for(ticker: str) -> "Contract":
-    """Best-effort translation of one of this tool's Yahoo-style tickers into
-    an IB contract. Indices in particular don't map 1:1 (Yahoo's ^GSPC vs
-    IB's SPX) -- for those you may need to pass IB's own symbol directly."""
-    if ticker.endswith("-USD"):
-        return Crypto(ticker[:-4], "PAXOS", "USD")
-    if ticker.startswith("^"):
-        return Index(ticker[1:], "CBOE", "USD")
-    for suffix, (exch, ccy) in _IB_SUFFIX_MAP.items():
-        if ticker.endswith(suffix):
-            return Stock(ticker[: -len(suffix)], exch, ccy)
-    return Stock(ticker, "SMART", "USD")
+_IB_PAGE_CAP = 200
+_RETRYABLE_IB_CODES = {1100, 1101, 1102, 2103, 2105, 2107, 2108}
+_PERMANENT_IB_CODES = {200, 321, 322, 354, 366, 420}
 
-def fetch_one_ibkr(ib: "IB", ticker: str, start: str, end: str, interval: str,
-                    adjust: bool, limiter: "RateLimiter"
-                    ) -> Tuple[str, Optional[pd.DataFrame], Optional[str]]:
+@dataclass(frozen=True)
+class IBFailure:
+    category: str
+    message: str
+    retryable: bool
+
+def classify_ib_error(exc: BaseException) -> IBFailure:
+    code = getattr(exc, "code", None)
+    message = str(getattr(exc, "message", "") or exc)
+    sanitized = re.sub(r"\s+", " ", message).strip()[:300]
+    sanitized = re.sub(
+        r"(?i)\b(account|acct)\s*[:=]?\s*[A-Z0-9-]+",
+        r"\1=<redacted>",
+        sanitized,
+    )
+    lowered = sanitized.lower()
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return IBFailure("RETRYABLE_CONNECTION", sanitized or type(exc).__name__, True)
+    if code == 162 and ("pacing" in lowered or "farm" in lowered or "temporar" in lowered):
+        return IBFailure("RETRYABLE_PACING", sanitized, True)
+    if code in _RETRYABLE_IB_CODES:
+        return IBFailure("RETRYABLE_CONNECTION", sanitized, True)
+    if code == 162:
+        return IBFailure("PERMANENT_NO_HISTORICAL_DATA", sanitized, False)
+    if code == 354 or "not subscribed" in lowered or "permission" in lowered:
+        return IBFailure("PERMANENT_NO_ENTITLEMENT", sanitized, False)
+    if code in _PERMANENT_IB_CODES:
+        return IBFailure("PERMANENT_REQUEST", sanitized, False)
+    return IBFailure("PERMANENT_REQUEST", sanitized or type(exc).__name__, False)
+
+def _call_ib_with_retries(call, retries: int, sleep_sec: float):
+    for attempt in range(retries + 1):
+        try:
+            return call()
+        except Exception as exc:
+            failure = classify_ib_error(exc)
+            if not failure.retryable or attempt >= retries:
+                raise RuntimeError(f"{failure.category}: {failure.message}") from exc
+            time.sleep(sleep_sec * (2 ** attempt))
+    raise AssertionError("bounded retry loop exhausted unexpectedly")
+
+def load_ib_contract_map(path: Optional[str]) -> Dict[str, Dict[str, Any]]:
+    selected = Path(path) if path else Path(__file__).with_name("ib_contracts.json")
+    if not selected.exists():
+        return {}
+    with selected.open("r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict):
+        raise ValueError(f"IBKR contract map must be a JSON object: {selected}")
+    return {str(key).upper(): value for key, value in raw.items()}
+
+def _ib_candidate_for(ticker: str, contract_map: Dict[str, Dict[str, Any]]) -> "Contract":
+    mapped = contract_map.get(ticker.upper())
+    if mapped is not None:
+        required = {"symbol", "secType", "exchange", "currency"}
+        if not isinstance(mapped, dict) or not required.issubset(mapped):
+            raise ValueError(f"incomplete explicit IBKR contract mapping for {ticker}")
+        return Contract(**mapped)
+    if ticker.startswith("^"):
+        raise ValueError(
+            f"unknown index alias {ticker!r}; add an explicit entry to the IBKR contract map"
+        )
+    if ticker.endswith("-USD"):
+        return Contract(symbol=ticker[:-4], secType="CRYPTO", exchange="PAXOS", currency="USD")
+    for suffix, (exchange, currency) in _IB_SUFFIX_MAP.items():
+        if ticker.endswith(suffix):
+            return Contract(
+                symbol=ticker[: -len(suffix)], secType="STK",
+                exchange=exchange, currency=currency,
+            )
+    return Contract(symbol=ticker, secType="STK", exchange="SMART", currency="USD")
+
+def resolve_ib_contract(
+    ib: "IB", ticker: str, contract_map: Dict[str, Dict[str, Any]],
+    retries: int = 0, sleep_sec: float = 0.5,
+) -> Tuple["Contract", Any]:
+    """Resolve exactly one contract and enforce the requested identity."""
+    candidate = _ib_candidate_for(ticker, contract_map)
+    details = _call_ib_with_retries(
+        lambda: ib.reqContractDetails(candidate), retries, sleep_sec
+    )
+    if len(details) != 1:
+        raise ValueError(
+            f"IBKR_AMBIGUOUS_CONTRACT: {ticker!r} resolved to {len(details)} contracts"
+        )
+    detail = details[0]
+    resolved = detail.contract
+    if not getattr(resolved, "conId", 0):
+        raise ValueError(f"IBKR_INVALID_CONTRACT: {ticker!r} resolved with conId=0")
+    if resolved.secType != candidate.secType:
+        raise ValueError(
+            f"IBKR_IDENTITY_MISMATCH: expected secType={candidate.secType}, "
+            f"resolved secType={resolved.secType}"
+        )
+    if candidate.currency and resolved.currency != candidate.currency:
+        raise ValueError(
+            f"IBKR_IDENTITY_MISMATCH: expected currency={candidate.currency}, "
+            f"resolved currency={resolved.currency}"
+        )
+    if candidate.exchange and candidate.exchange != "SMART":
+        exchanges = {resolved.exchange, getattr(resolved, "primaryExchange", "")}
+        if candidate.exchange not in exchanges:
+            raise ValueError(
+                f"IBKR_IDENTITY_MISMATCH: expected exchange={candidate.exchange}, "
+                f"resolved exchange={resolved.exchange}, "
+                f"primaryExchange={getattr(resolved, 'primaryExchange', '')}"
+            )
+    expected_primary = getattr(candidate, "primaryExchange", "")
+    if expected_primary and getattr(resolved, "primaryExchange", "") != expected_primary:
+        raise ValueError(
+            f"IBKR_IDENTITY_MISMATCH: expected primaryExchange={expected_primary}, "
+            f"resolved primaryExchange={getattr(resolved, 'primaryExchange', '')}"
+        )
+    return resolved, detail
+
+def _is_calendar_interval(interval: str) -> bool:
+    return interval in {"1d", "1wk", "1mo"}
+
+def _ib_timezone(detail: Any) -> ZoneInfo:
+    timezone_id = getattr(detail, "timeZoneId", "") or "UTC"
+    try:
+        return ZoneInfo(timezone_id)
+    except Exception as exc:
+        raise ValueError(f"IBKR_INVALID_TIMEZONE: unsupported timeZoneId={timezone_id!r}") from exc
+
+def _utc_timestamp(value: Any) -> pd.Timestamp:
+    if isinstance(value, (int, float)):
+        return pd.to_datetime(value, unit="s", utc=True)
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        raise ValueError("IBKR_INVALID_TIME: intraday bar timestamp is timezone-naive")
+    return timestamp.tz_convert("UTC")
+
+def _ib_metadata(
+    ticker: str, interval: str, adjust: bool, start: str, end: str,
+    resolved: "Contract", detail: Any, what_to_show: str, use_rth: bool,
+) -> Dict[str, Any]:
+    return {
+        "schema_version": _METADATA_SCHEMA_VERSION,
+        "source": "ibkr",
+        "requested_ticker": ticker,
+        "interval": interval,
+        "adjusted": adjust,
+        "requested_start": start,
+        "requested_end": end,
+        "fetched_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "data_sha256": "",
+        "time_semantics": "calendar_date" if _is_calendar_interval(interval) else "utc_instant",
+        "ibkr": {
+            "conId": resolved.conId,
+            "symbol": resolved.symbol,
+            "localSymbol": getattr(resolved, "localSymbol", ""),
+            "secType": resolved.secType,
+            "exchange": resolved.exchange,
+            "primaryExchange": getattr(resolved, "primaryExchange", ""),
+            "currency": resolved.currency,
+            "timeZoneId": getattr(detail, "timeZoneId", "") or "",
+            "barSizeSetting": _IB_BAR_SIZE[interval],
+            "whatToShow": what_to_show,
+            "useRTH": use_rth,
+        },
+    }
+
+def fetch_one_ibkr(
+    ib: "IB", ticker: str, start: str, end: str, interval: str,
+    adjust: bool, limiter: "RateLimiter", contract_map: Dict[str, Dict[str, Any]],
+    use_rth: bool, retries: int, sleep_sec: float,
+    expected_con_id: Optional[int] = None,
+) -> Tuple[str, Optional[pd.DataFrame], Optional[str], Optional[Dict[str, Any]]]:
     bar_size = _IB_BAR_SIZE.get(interval)
     if bar_size is None:
-        return ticker, None, f"interval={interval} has no IBKR equivalent (try 1d/1h/1wk/1mo/etc.)"
-
-    contract = _ib_contract_for(ticker)
+        return ticker, None, f"PERMANENT_UNSUPPORTED_INTERVAL: interval={interval}", None
     try:
         limiter.wait()
-        qualified = ib.qualifyContracts(contract)
+        contract, details = resolve_ib_contract(
+            ib, ticker, contract_map, retries=retries, sleep_sec=sleep_sec
+        )
     except Exception as e:
-        return ticker, None, f"IBKR contract qualification failed: {e}"
-    if not qualified or not qualified[0].conId:
-        return ticker, None, f"IBKR could not resolve a contract for {ticker!r} ({contract})"
-    contract = qualified[0]
+        return ticker, None, str(e), None
+    if expected_con_id is not None and contract.conId != expected_con_id:
+        return ticker, None, (
+            f"PROVENANCE_FAILURE: IBKR conId mismatch: "
+            f"existing={expected_con_id}, resolved={contract.conId}"
+        ), None
 
-    start_ts = pd.Timestamp(start)
-    end_dt = pd.Timestamp(end).to_pydatetime()
+    calendar = _is_calendar_interval(interval)
+    timezone = _ib_timezone(details)
+    start_date = dt.date.fromisoformat(start)
+    end_date = dt.date.fromisoformat(end)
+    start_utc = pd.Timestamp(dt.datetime.combine(start_date, dt.time.min, timezone)).tz_convert("UTC")
+    end_exclusive_utc = pd.Timestamp(
+        dt.datetime.combine(end_date + dt.timedelta(days=1), dt.time.min, timezone)
+    ).tz_convert("UTC")
     chunk = _IB_CHUNK_DURATION.get(bar_size, "1 Y")
     what_to_show = "ADJUSTED_LAST" if adjust else "TRADES"
+    format_date = 1 if calendar else 2
 
     all_bars, seen_dates = [], set()
-    cursor = end_dt
-    for _ in range(200):  # hard safety cap on paged requests per ticker
+    cursor = end_date if calendar else end_exclusive_utc.to_pydatetime()
+    reached_start = False
+    exhausted_page_cap = True
+    for _ in range(_IB_PAGE_CAP):
         limiter.wait()
         try:
-            bars = ib.reqHistoricalData(
-                contract, endDateTime=cursor, durationStr=chunk,
-                barSizeSetting=bar_size, whatToShow=what_to_show, useRTH=True,
+            bars = _call_ib_with_retries(
+                lambda: ib.reqHistoricalData(
+                    contract, endDateTime=cursor, durationStr=chunk,
+                    barSizeSetting=bar_size, whatToShow=what_to_show,
+                    useRTH=use_rth, formatDate=format_date,
+                ), retries, sleep_sec,
             )
         except Exception as e:
-            return ticker, None, f"IBKR historical data request failed: {e}"
+            return ticker, None, str(e), None
         new_bars = [b for b in bars if b.date not in seen_dates]
         if not new_bars:
+            exhausted_page_cap = False
             break
         seen_dates.update(b.date for b in new_bars)
         all_bars.extend(new_bars)
-        earliest_ts = pd.Timestamp(min(b.date for b in new_bars))
-        if earliest_ts.tzinfo is not None:
-            earliest_ts = earliest_ts.tz_localize(None)
-        if earliest_ts <= start_ts:
+        if calendar:
+            earliest = min(pd.Timestamp(b.date).date() for b in new_bars)
+            reached_start = earliest <= start_date
+            cursor = earliest
+        else:
+            try:
+                earliest_ts = min(_utc_timestamp(b.date) for b in new_bars)
+            except ValueError as exc:
+                return ticker, None, str(exc), None
+            reached_start = earliest_ts <= start_utc
+            cursor = earliest_ts.to_pydatetime()
+        if reached_start:
+            exhausted_page_cap = False
             break
-        cursor = earliest_ts.to_pydatetime()
+
+    if all_bars and not reached_start and exhausted_page_cap:
+        return ticker, None, (
+            f"PERMANENT_PAGE_CAP: requested start {start} was not reached "
+            f"within {_IB_PAGE_CAP} historical pages"
+        ), None
+    if all_bars and not reached_start:
+        return ticker, None, (
+            f"PERMANENT_NO_HISTORICAL_DATA: IBKR history ended before requested start {start}"
+        ), None
 
     if not all_bars:
-        return ticker, None, "No data returned from IBKR."
+        return ticker, None, "PERMANENT_NO_HISTORICAL_DATA: empty confirmed response", None
 
+    raw_dates = [b.date for b in all_bars]
+    if calendar:
+        index = pd.DatetimeIndex([pd.Timestamp(value).date() for value in raw_dates])
+    else:
+        try:
+            index = pd.DatetimeIndex([_utc_timestamp(value) for value in raw_dates])
+        except ValueError as exc:
+            return ticker, None, str(exc), None
     df = pd.DataFrame({
         "Open": [b.open for b in all_bars],
         "High": [b.high for b in all_bars],
         "Low": [b.low for b in all_bars],
         "Close": [b.close for b in all_bars],
         "Volume": [b.volume for b in all_bars],
-    }, index=pd.to_datetime([b.date for b in all_bars]))
+    }, index=index)
     df.index.name = "Date"
     df = df[~df.index.duplicated(keep="last")].sort_index()
-    df = df[(df.index >= start_ts) & (df.index <= pd.Timestamp(end_dt))]
+    if calendar:
+        df = df[(df.index.date >= start_date) & (df.index.date <= end_date)]
+    else:
+        df = df[(df.index >= start_utc) & (df.index < end_exclusive_utc)]
     if df.empty:
-        return ticker, None, "No data in requested range from IBKR."
-    return ticker, df, None
+        return ticker, None, "PERMANENT_NO_HISTORICAL_DATA: no bars in requested range", None
+    metadata = _ib_metadata(
+        ticker, interval, adjust, start, end, contract, details, what_to_show, use_rth
+    )
+    return ticker, df, None, metadata
 
 def ib_connect(host: str, port: int, client_id: int) -> "IB":
+    if client_id == 0:
+        raise ValueError("IBKR clientId must be non-zero")
     ib = IB()
-    ib.connect(host, port, clientId=client_id, timeout=10)
+    ib.RaiseRequestErrors = True
+    ib.connect(
+        host, port, clientId=client_id, timeout=10, readonly=True,
+        fetchFields=StartupFetchNONE,
+    )
     return ib
+
+def ib_connect_with_retries(
+    host: str, port: int, client_id: int, retries: int, sleep_sec: float
+) -> "IB":
+    return _call_ib_with_retries(
+        lambda: ib_connect(host, port, client_id), retries, sleep_sec
+    )
 
 # ---------- interval range sanity check ----------
 # Approximate limits Yahoo enforces on intraday history (days of lookback).
@@ -446,6 +788,12 @@ def parse_args() -> argparse.Namespace:
                         "Common values: 7497 TWS paper, 4001 IB Gateway live, 4002 IB Gateway paper.")
     p.add_argument("--ib-client-id", type=int, default=42,
                    help="IB API client id. Must be unique among concurrent API connections. Default: 42")
+    p.add_argument("--ib-contract-map",
+                   help="Explicit IBKR contract mapping JSON. Default: repo ib_contracts.json")
+    p.add_argument("--ib-use-rth", action=argparse.BooleanOptionalAction, default=True,
+                   help="IBKR regular-hours policy. Default: true; use --no-ib-use-rth for extended hours.")
+    p.add_argument("--ib-retries", type=int, default=2,
+                   help="Bounded retries after an IBKR retryable failure. Default: 2")
     p.add_argument("--ib-rate-limit", type=float, default=2.0,
                    help="Max historical-data requests/sec to IBKR (separate from --rate-limit, "
                         "which only applies to yfinance). Default: 2.0")
@@ -502,7 +850,10 @@ def main():
             _log_file_handle.close()
 
 def _run(args: argparse.Namespace):
-    if args.include_today:
+    if args.source == "ibkr" and args.include_today:
+        log("[err] --include-today is unsupported for --source ibkr; provide an explicit --end date")
+        raise SystemExit(2)
+    if args.source == "yfinance" and args.include_today:
         try:
             y, m, d = map(int, args.end.split("-"))
             end_dt = dt.date(y, m, d) + dt.timedelta(days=1)
@@ -524,7 +875,12 @@ def _run(args: argparse.Namespace):
             log("[err] --source ibkr requires the 'ib_async' package: pip install ib_async")
             return
         try:
-            ib = ib_connect(args.ib_host, args.ib_port, args.ib_client_id)
+            if args.ib_client_id == 0:
+                raise ValueError("--ib-client-id must be non-zero")
+            ib = ib_connect_with_retries(
+                args.ib_host, args.ib_port, args.ib_client_id,
+                args.ib_retries, args.sleep,
+            )
         except Exception as e:
             log(f"[err] Could not connect to TWS/IB Gateway at {args.ib_host}:{args.ib_port} -- {e}")
             log("      Make sure TWS or IB Gateway is running, logged in, and API access is enabled "
@@ -541,6 +897,7 @@ def _run(args: argparse.Namespace):
 
 def _run_with_source(args: argparse.Namespace, tickers: List[str],
                       limiter: "RateLimiter", ib: Optional["IB"]) -> None:
+    contract_map = load_ib_contract_map(args.ib_contract_map) if args.source == "ibkr" else {}
     # validation
     if args.validate:
         log(f"[info] validating {len(tickers)} tickers ...")
@@ -549,19 +906,17 @@ def _run_with_source(args: argparse.Namespace, tickers: List[str],
             for t in tickers:
                 limiter.wait()
                 try:
-                    contract = _ib_contract_for(t)
-                    qualified = ib.qualifyContracts(contract)
-                    if not qualified or not qualified[0].conId:
-                        invalid.append((t, "IBKR could not resolve a contract"))
-                        continue
-                    name = ""
-                    try:
-                        details = ib.reqContractDetails(qualified[0])
-                        if details:
-                            name = details[0].longName or ""
-                    except Exception:
-                        pass
-                    valid.append((t, name, qualified[0].exchange or ""))
+                    resolved, details = resolve_ib_contract(
+                        ib, t, contract_map, args.ib_retries, args.sleep
+                    )
+                    identity = (
+                        f"symbol={resolved.symbol} localSymbol={getattr(resolved, 'localSymbol', '')} "
+                        f"conId={resolved.conId} secType={resolved.secType} "
+                        f"exchange={resolved.exchange} "
+                        f"primaryExchange={getattr(resolved, 'primaryExchange', '')} "
+                        f"currency={resolved.currency} longName={getattr(details, 'longName', '')}"
+                    )
+                    valid.append((t, identity, resolved.exchange or ""))
                 except Exception as e:
                     invalid.append((t, str(e)))
         else:
@@ -618,20 +973,43 @@ def _run_with_source(args: argparse.Namespace, tickers: List[str],
     fetch_plan: Dict[str, Tuple[str, Optional[pd.DataFrame]]] = {}
     tickers_to_fetch: List[str] = []
     skipped: List[str] = []
+    provenance: Dict[str, Dict[str, Any]] = {}
+    what_to_show = "ADJUSTED_LAST" if args.adjust else "TRADES"
 
     for t in tickers:
-        out_path = os.path.join(args.outdir, f"{t}.{args.format}")
+        out_path = output_path(args, t)
         exists = os.path.exists(out_path)
 
         if exists and not args.overwrite and not args.append:
+            if args.source == "ibkr" or os.path.exists(_metadata_path(out_path)):
+                try:
+                    load_and_validate_metadata(
+                        out_path, source=args.source, ticker=t, interval=args.interval,
+                        adjusted=args.adjust, ib_use_rth=args.ib_use_rth,
+                        what_to_show=what_to_show if args.source == "ibkr" else None,
+                    )
+                except ValueError as exc:
+                    raise RuntimeError(f"PROVENANCE_FAILURE: {t}: {exc}") from exc
             skipped.append(t)
             continue
 
         eff_start = args.start
         df_old = None
         if exists and args.append:
+            try:
+                provenance[t] = load_and_validate_metadata(
+                    out_path, source=args.source, ticker=t, interval=args.interval,
+                    adjusted=args.adjust, ib_use_rth=args.ib_use_rth,
+                    what_to_show=what_to_show if args.source == "ibkr" else None,
+                )
+            except ValueError as exc:
+                raise RuntimeError(f"PROVENANCE_FAILURE: {t}: {exc}") from exc
             df_old = load_existing(out_path, args.format)
-            if df_old is not None and not df_old.empty:
+            if df_old is None:
+                raise RuntimeError(
+                    f"PROVENANCE_FAILURE: {t}: existing data could not be read; refusing append"
+                )
+            if not df_old.empty:
                 last_date = df_old.index.max()
                 if pd.notna(last_date):
                     buffered = (last_date.date() - dt.timedelta(days=args.append_lookback_days)).isoformat()
@@ -642,7 +1020,7 @@ def _run_with_source(args: argparse.Namespace, tickers: List[str],
         tickers_to_fetch.append(t)
 
     for t in skipped:
-        log(f"[skip] {t}: output file already exists -> {os.path.join(args.outdir, f'{t}.{args.format}')}")
+        log(f"[skip] {t}: output file already exists -> {output_path(args, t)}")
 
     log(f"[info] downloading {len(tickers_to_fetch)} tickers via {args.source} @ {args.interval} "
         f"({len(skipped)} skipped, already exist)")
@@ -653,8 +1031,14 @@ def _run_with_source(args: argparse.Namespace, tickers: List[str],
         # sequentially through it rather than hammering it from a thread
         # pool the way the independent yfinance HTTP sessions can be.
         for t in tickers_to_fetch:
-            results.append(fetch_one_ibkr(ib, t, fetch_plan[t][0], args.end, args.interval,
-                                           args.adjust, limiter))
+            expected_con_id = (
+                provenance[t]["ibkr"]["conId"] if t in provenance else None
+            )
+            results.append(fetch_one_ibkr(
+                ib, t, fetch_plan[t][0], args.end, args.interval, args.adjust,
+                limiter, contract_map, args.ib_use_rth, args.ib_retries, args.sleep,
+                expected_con_id,
+            ))
     else:
         with cf.ThreadPoolExecutor(max_workers=max(1, args.threads)) as ex:
             futures = [
@@ -663,33 +1047,45 @@ def _run_with_source(args: argparse.Namespace, tickers: List[str],
                 for t in tickers_to_fetch
             ]
             for fut in cf.as_completed(futures):
-                results.append(fut.result())
+                ticker, frame, error = fut.result()
+                results.append((ticker, frame, error, None))
 
     successes, failures = 0, []
     os.makedirs(args.outdir, exist_ok=True)
 
-    for ticker, df_new, err in sorted(results, key=lambda x: x[0]):
-        out_path = os.path.join(args.outdir, f"{ticker}.{args.format}")
+    for ticker, df_new, err, fetched_metadata in sorted(results, key=lambda x: x[0]):
+        out_path = output_path(args, ticker)
 
         if df_new is None or (not args.show_empty and df_new.empty):
             msg = err or "Empty dataframe"
+            if msg.startswith("PROVENANCE_FAILURE:"):
+                raise RuntimeError(f"{ticker}: {msg}")
             log(f"[err]  {ticker}: {msg}")
             failures.append((ticker, msg))
             continue
 
+        metadata = fetched_metadata or _base_metadata(args, ticker)
+        metadata["requested_start"] = args.start
+        metadata["requested_end"] = args.end
+        if args.append and args.source == "ibkr" and ticker in provenance:
+            try:
+                validate_ib_append_identity(provenance[ticker], metadata)
+            except ValueError as exc:
+                raise RuntimeError(f"PROVENANCE_FAILURE: {ticker}: {exc}") from exc
+
         if args.overwrite and os.path.exists(out_path):
-            save_frame(df_new, out_path, args.format)
+            save_frame_with_metadata(df_new, out_path, args.format, metadata)
             log(f"[ok]  {ticker}: {len(df_new):>5} rows -> {out_path} (overwrote)")
             successes += 1
         elif args.append and os.path.exists(out_path):
             df_old = fetch_plan.get(ticker, (None, None))[1]
             merged = align_and_merge(df_old, df_new) if df_old is not None else df_new
-            save_frame(merged, out_path, args.format)
+            save_frame_with_metadata(merged, out_path, args.format, metadata)
             added = len(merged) - (0 if df_old is None else len(df_old))
             log(f"[ok]  {ticker}: {len(merged):>5} rows -> {out_path} (appended {max(0, added)} new rows)")
             successes += 1
         else:
-            save_frame(df_new, out_path, args.format)
+            save_frame_with_metadata(df_new, out_path, args.format, metadata)
             log(f"[ok]  {ticker}: {len(df_new):>5} rows -> {out_path}")
             successes += 1
 

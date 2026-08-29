@@ -1,0 +1,26 @@
+{
+  "SPX": {
+    "currency": "USD",
+    "exchange": "CBOE",
+    "secType": "IND",
+    "symbol": "SPX"
+  },
+  "VIX": {
+    "currency": "USD",
+    "exchange": "CBOE",
+    "secType": "IND",
+    "symbol": "VIX"
+  },
+  "^GSPC": {
+    "currency": "USD",
+    "exchange": "CBOE",
+    "secType": "IND",
+    "symbol": "SPX"
+  },
+  "^VIX": {
+    "currency": "USD",
+    "exchange": "CBOE",
+    "secType": "IND",
+    "symbol": "VIX"
+  }
+}

@@ -83,6 +83,9 @@ raising `--retries`.
 
 ### Alternative source: Interactive Brokers
 
+> **IBKR mode is historical MARKET DATA ONLY. It contains no trading or order
+> execution capability and is not approved as production-validated.**
+
 `--source ibkr` pulls bars from a running **TWS** or **IB Gateway** instance over its local API
 socket (via `ib_async`) instead of scraping Yahoo. This is your own broker connection, so it isn't
 subject to Yahoo's rate-limiting, and it can reach some symbols/exchanges Yahoo has no data for.
@@ -90,6 +93,11 @@ subject to Yahoo's rate-limiting, and it can reach some symbols/exchanges Yahoo 
 **Requirements:**
 - TWS or IB Gateway running and **logged in**
 - API access enabled: *File → Global Configuration → API → Settings → Enable ActiveX and Socket Clients*
+- TWS / IB Gateway **Read-Only API** setting enabled. The client also connects
+  with `readonly=True` and `StartupFetchNONE`; this code-side defense does not
+  replace the gateway setting.
+- Prefer localhost or a tightly controlled trusted IP.
+- A dedicated, non-zero client ID.
 - Market data subscriptions for whatever exchanges you're requesting
 
 ```bash
@@ -100,22 +108,55 @@ python get_stock_data.py -i tickers.list --source ibkr --ib-port 7496
 - `--ib-port` : API port. Default: `7496` (TWS live). Other common ports: `7497` TWS paper,
   `4001` IB Gateway live, `4002` IB Gateway paper
 - `--ib-client-id` : API client id — must be unique among concurrent API connections. Default: `42`
+- `--ib-contract-map` : explicit contract mapping JSON. Defaults to the
+  committed `ib_contracts.json`. Unknown `^` index aliases fail instead of
+  guessing an exchange.
+- `--ib-use-rth` / `--no-ib-use-rth`: `true` (default) requests Regular
+  Trading Hours only; `false` includes available extended-hours data.
+- `--ib-retries`: bounded retry count after retryable IBKR failures. Default: `2`.
 - `--ib-rate-limit` : max historical-data requests/sec over the IB connection (separate from
   `--rate-limit`, which only applies to yfinance). Default: `2.0`
 - `--adjust` : with `--source ibkr`, requests split/dividend-adjusted bars (`ADJUSTED_LAST`)
   instead of raw `TRADES`, rather than yfinance's post-hoc rescaling
 
-Tickers use this tool's normal Yahoo-style format and get translated to IB contracts on a
-best-effort basis: `.TA` → TASE, `.KS`/`.KQ` → Korea, `.L`/`.DE`/`.PA`/`.HK`/`.TO`/`.AX` → their
-respective exchanges, `BTC-USD`-style pairs → IB crypto contracts, a bare symbol → a US stock/ETF
-on IB's SMART router. **Indices are the main exception** — Yahoo's `^GSPC`/`^VIX`-style symbols
-don't match IB's own index symbols (`SPX`, `VIX`), so those may need to be entered directly in IB's
-symbol form. IBKR output has `Open/High/Low/Close/Volume` only — no `Adj Close`/`Dividends`/`Stock
-Splits` columns (those are yfinance-specific).
+Tickers remain user-facing aliases. IBKR resolution requires exactly one
+contract detail, validates the mapped security type/currency/exchange, and then
+uses `conId` as canonical identity. SPX, VIX, `^GSPC`, and `^VIX` have explicit
+index mappings. Unknown `^` aliases fail; no index silently uses the stock
+`SMART` route. IBKR output has `Open/High/Low/Close/Volume` only — no `Adj
+Close`/`Dividends`/`Stock Splits` columns (those are yfinance-specific).
 
 Because IB uses a single persistent API connection rather than independent HTTP requests, `--source
 ibkr` downloads sequentially through that one connection (not via `--threads`) and pages long date
 ranges backward in chunks automatically.
+
+IBKR and Yahoo datasets never share a path and are never automatically mixed or
+used as fallbacks:
+
+```
+history/AAPL.csv                 # yfinance
+history/AAPL.csv.meta.json
+history/ibkr/AAPL.csv            # IBKR
+history/ibkr/AAPL.csv.meta.json
+```
+
+Every new or overwritten dataset has a mandatory provenance sidecar containing
+the data SHA-256, query semantics, and (for IBKR) resolved contract identity.
+Append fails on missing/invalid metadata, changed source/ticker/interval/
+adjustment/RTH/what-to-show, changed `conId`, or a data hash mismatch. A legacy
+Yahoo file may still be skipped normally, but cannot be appended until one
+`--overwrite` establishes trusted metadata. There is no automatic source
+fallback or automatic contract migration.
+
+Daily/weekly/monthly IBKR bars retain calendar-date semantics. Intraday IBKR
+requests use `formatDate=2`, retain timezone-aware UTC instants, and interpret
+date boundaries in the resolved instrument timezone. `--include-today` remains
+Yahoo-specific and fails clearly with IBKR.
+
+Live validation is still required before trusting this pipeline. A later,
+separate read-only TWS validation must compare resolved identity and historical
+bars for representative US, TASE, and SPX instruments; no account values belong
+in validation output.
 
 ### Validation
 
@@ -151,8 +192,14 @@ Each ticker is saved as a separate file:
 ```
 history/
   AAPL.csv
+  AAPL.csv.meta.json
   MSFT.csv
+  MSFT.csv.meta.json
   NVDA.csv
+  NVDA.csv.meta.json
+  ibkr/
+    AAPL.csv
+    AAPL.csv.meta.json
 ```
 
 Columns (when available):

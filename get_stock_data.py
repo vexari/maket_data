@@ -36,10 +36,12 @@ Examples:
 """
 
 import argparse
+import asyncio
 import concurrent.futures as cf
 import datetime as dt
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -71,11 +73,19 @@ except ImportError:  # older yfinance without a dedicated rate-limit exception
 
 try:
     from ib_async import IB, Contract, RequestError, StartupFetchNONE
+    from ib_async.client import Client
+    from ib_async.objects import BarDataList
+    from ib_async.wrapper import Wrapper
+    import ib_async.util as ib_util
 except ImportError:
     IB = None  # only required when --source ibkr is used
     Contract = Any
     RequestError = Exception
     StartupFetchNONE = None
+    Client = Any
+    BarDataList = Any
+    Wrapper = Any
+    ib_util = None
 
 _log_file_handle = None  # set in main() when --log-file is given
 
@@ -237,9 +247,7 @@ def _base_metadata(args: argparse.Namespace, ticker: str) -> Dict[str, Any]:
         "requested_end": args.end,
         "fetched_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "data_sha256": "",
-        "time_semantics": (
-            "calendar_date" if _is_calendar_interval(args.interval) else "utc_instant"
-        ),
+        "time_semantics": _time_semantics(args.source, args.interval),
         "ibkr": None,
     }
 
@@ -440,6 +448,22 @@ _IB_CHUNK_DURATION = {
     "1 day": "1 Y", "1 week": "5 Y", "1 month": "10 Y",
 }
 
+_IB_WINDOW_DELTA = {
+    "1 min": dt.timedelta(days=1), "2 mins": dt.timedelta(days=2),
+    "5 mins": dt.timedelta(days=5), "15 mins": dt.timedelta(days=10),
+    "30 mins": dt.timedelta(days=20), "1 hour": dt.timedelta(days=30),
+    "1 day": dt.timedelta(days=366), "1 week": dt.timedelta(days=5 * 366),
+    "1 month": dt.timedelta(days=10 * 366),
+}
+
+_IB_BAR_DELTA = {
+    "1 min": dt.timedelta(minutes=1), "2 mins": dt.timedelta(minutes=2),
+    "5 mins": dt.timedelta(minutes=5), "15 mins": dt.timedelta(minutes=15),
+    "30 mins": dt.timedelta(minutes=30), "1 hour": dt.timedelta(hours=1),
+    "1 day": dt.timedelta(days=1), "1 week": dt.timedelta(days=7),
+    "1 month": dt.timedelta(days=28),
+}
+
 # Yahoo-style suffix -> (IB exchange, currency). Bare symbols (no suffix)
 # are treated as US stocks/ETFs on IB's SMART router. Extend this for other
 # exchanges as needed -- it only covers what this tool's own ticker lists use
@@ -471,28 +495,38 @@ def classify_ib_error(exc: BaseException) -> IBFailure:
     )
     lowered = sanitized.lower()
     if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
-        return IBFailure("RETRYABLE_CONNECTION", sanitized or type(exc).__name__, True)
+        category = "RETRYABLE_TIMEOUT" if isinstance(exc, TimeoutError) else "RETRYABLE_CONNECTION"
+        return IBFailure(category, sanitized or type(exc).__name__, True)
+    if code == 354 or "not subscribed" in lowered or "permission" in lowered:
+        return IBFailure("PERMANENT_NO_ENTITLEMENT", sanitized, False)
     if code == 162 and ("pacing" in lowered or "farm" in lowered or "temporar" in lowered):
         return IBFailure("RETRYABLE_PACING", sanitized, True)
     if code in _RETRYABLE_IB_CODES:
         return IBFailure("RETRYABLE_CONNECTION", sanitized, True)
     if code == 162:
         return IBFailure("PERMANENT_NO_HISTORICAL_DATA", sanitized, False)
-    if code == 354 or "not subscribed" in lowered or "permission" in lowered:
-        return IBFailure("PERMANENT_NO_ENTITLEMENT", sanitized, False)
     if code in _PERMANENT_IB_CODES:
         return IBFailure("PERMANENT_REQUEST", sanitized, False)
     return IBFailure("PERMANENT_REQUEST", sanitized or type(exc).__name__, False)
 
-def _call_ib_with_retries(call, retries: int, sleep_sec: float):
+def _call_ib_with_retries(
+    call, retries: int, sleep_sec: float, *, sleep_fn=None,
+    retry_connection: bool = False,
+):
+    sleep_fn = sleep_fn or time.sleep
     for attempt in range(retries + 1):
         try:
             return call()
         except Exception as exc:
             failure = classify_ib_error(exc)
-            if not failure.retryable or attempt >= retries:
+            connection_failure = failure.category == "RETRYABLE_CONNECTION"
+            if (
+                not failure.retryable
+                or (connection_failure and not retry_connection)
+                or attempt >= retries
+            ):
                 raise RuntimeError(f"{failure.category}: {failure.message}") from exc
-            time.sleep(sleep_sec * (2 ** attempt))
+            sleep_fn(sleep_sec * (2 ** attempt))
     raise AssertionError("bounded retry loop exhausted unexpectedly")
 
 def load_ib_contract_map(path: Optional[str]) -> Dict[str, Dict[str, Any]]:
@@ -533,7 +567,8 @@ def resolve_ib_contract(
     """Resolve exactly one contract and enforce the requested identity."""
     candidate = _ib_candidate_for(ticker, contract_map)
     details = _call_ib_with_retries(
-        lambda: ib.reqContractDetails(candidate), retries, sleep_sec
+        lambda: ib.reqContractDetails(candidate), retries, sleep_sec,
+        sleep_fn=getattr(ib, "sleep", None),
     )
     if len(details) != 1:
         raise ValueError(
@@ -569,8 +604,24 @@ def resolve_ib_contract(
         )
     return resolved, detail
 
+def _format_ib_validation_identity(resolved: "Contract", detail: Any) -> str:
+    return (
+        f"symbol={resolved.symbol} localSymbol={getattr(resolved, 'localSymbol', '')} "
+        f"conId={resolved.conId} secType={resolved.secType} "
+        f"exchange={resolved.exchange} "
+        f"primaryExchange={getattr(resolved, 'primaryExchange', '')} "
+        f"currency={resolved.currency} longName={getattr(detail, 'longName', '')}"
+    )
+
 def _is_calendar_interval(interval: str) -> bool:
     return interval in {"1d", "1wk", "1mo"}
+
+def _time_semantics(source: str, interval: str) -> str:
+    calendar_intervals = (
+        {"1d", "1wk", "1mo"} if source == "ibkr"
+        else {"1d", "5d", "1wk", "1mo", "3mo"}
+    )
+    return "calendar_date" if interval in calendar_intervals else "utc_instant"
 
 def _ib_timezone(detail: Any) -> ZoneInfo:
     timezone_id = getattr(detail, "timeZoneId", "") or "UTC"
@@ -587,6 +638,14 @@ def _utc_timestamp(value: Any) -> pd.Timestamp:
         raise ValueError("IBKR_INVALID_TIME: intraday bar timestamp is timezone-naive")
     return timestamp.tz_convert("UTC")
 
+def _calendar_value(value: Any, timezone: ZoneInfo) -> dt.date:
+    if isinstance(value, dt.date) and not isinstance(value, dt.datetime):
+        return value
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert(timezone)
+    return timestamp.date()
+
 def _ib_metadata(
     ticker: str, interval: str, adjust: bool, start: str, end: str,
     resolved: "Contract", detail: Any, what_to_show: str, use_rth: bool,
@@ -601,7 +660,7 @@ def _ib_metadata(
         "requested_end": end,
         "fetched_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "data_sha256": "",
-        "time_semantics": "calendar_date" if _is_calendar_interval(interval) else "utc_instant",
+        "time_semantics": _time_semantics("ibkr", interval),
         "ibkr": {
             "conId": resolved.conId,
             "symbol": resolved.symbol,
@@ -651,10 +710,26 @@ def fetch_one_ibkr(
     what_to_show = "ADJUSTED_LAST" if adjust else "TRADES"
     format_date = 1 if calendar else 2
 
+    try:
+        limiter.wait()
+        head_value = _call_ib_with_retries(
+            lambda: ib.reqHeadTimeStamp(
+                contract, whatToShow=what_to_show, useRTH=use_rth, timeout=30
+            ),
+            retries, sleep_sec, sleep_fn=getattr(ib, "sleep", None),
+        )
+        known_head = (
+            _calendar_value(head_value, timezone)
+            if calendar else _utc_timestamp(head_value)
+        )
+    except Exception as exc:
+        return ticker, None, str(exc), None
+
+    target_start = max(start_date, known_head) if calendar else max(start_utc, known_head)
+
     all_bars, seen_dates = [], set()
     cursor = end_date if calendar else end_exclusive_utc.to_pydatetime()
     reached_start = False
-    exhausted_page_cap = True
     for _ in range(_IB_PAGE_CAP):
         limiter.wait()
         try:
@@ -662,40 +737,39 @@ def fetch_one_ibkr(
                 lambda: ib.reqHistoricalData(
                     contract, endDateTime=cursor, durationStr=chunk,
                     barSizeSetting=bar_size, whatToShow=what_to_show,
-                    useRTH=use_rth, formatDate=format_date,
-                ), retries, sleep_sec,
+                    useRTH=use_rth, formatDate=format_date, timeout=60,
+                ), retries, sleep_sec, sleep_fn=getattr(ib, "sleep", None),
             )
         except Exception as e:
             return ticker, None, str(e), None
         new_bars = [b for b in bars if b.date not in seen_dates]
         if not new_bars:
-            exhausted_page_cap = False
-            break
+            cursor_value = cursor if calendar else _utc_timestamp(cursor)
+            if cursor_value <= known_head:
+                reached_start = True
+                break
+            cursor = cursor - _IB_WINDOW_DELTA[bar_size]
+            continue
         seen_dates.update(b.date for b in new_bars)
         all_bars.extend(new_bars)
         if calendar:
-            earliest = min(pd.Timestamp(b.date).date() for b in new_bars)
-            reached_start = earliest <= start_date
-            cursor = earliest
+            earliest = min(_calendar_value(b.date, timezone) for b in new_bars)
+            reached_start = earliest <= target_start
+            cursor = earliest - _IB_BAR_DELTA[bar_size]
         else:
             try:
                 earliest_ts = min(_utc_timestamp(b.date) for b in new_bars)
             except ValueError as exc:
                 return ticker, None, str(exc), None
-            reached_start = earliest_ts <= start_utc
-            cursor = earliest_ts.to_pydatetime()
+            reached_start = earliest_ts <= target_start
+            cursor = (earliest_ts - _IB_BAR_DELTA[bar_size]).to_pydatetime()
         if reached_start:
-            exhausted_page_cap = False
             break
 
-    if all_bars and not reached_start and exhausted_page_cap:
+    if not reached_start:
         return ticker, None, (
             f"PERMANENT_PAGE_CAP: requested start {start} was not reached "
             f"within {_IB_PAGE_CAP} historical pages"
-        ), None
-    if all_bars and not reached_start:
-        return ticker, None, (
-            f"PERMANENT_NO_HISTORICAL_DATA: IBKR history ended before requested start {start}"
         ), None
 
     if not all_bars:
@@ -729,22 +803,150 @@ def fetch_one_ibkr(
     )
     return ticker, df, None, metadata
 
-def ib_connect(host: str, port: int, client_id: int) -> "IB":
-    if client_id == 0:
-        raise ValueError("IBKR clientId must be non-zero")
-    ib = IB()
-    ib.RaiseRequestErrors = True
-    ib.connect(
-        host, port, clientId=client_id, timeout=10, readonly=True,
-        fetchFields=StartupFetchNONE,
-    )
-    return ib
+class _MarketDataWrapper(Wrapper):
+    """Discard unavoidable handshake account IDs without caching or emitting."""
+
+    def managedAccounts(self, _accounts_list: str) -> None:
+        return None
+
+
+class _MarketDataIB(IB):
+    """IB request machinery with a market-data-only connection lifecycle."""
+
+    def __init__(self):
+        super().__init__()
+        self.wrapper = _MarketDataWrapper(self)
+        self.client = Client(self.wrapper)
+        self.client.apiEnd += self.disconnectedEvent
+
+    async def connectAsync(
+        self, host: str, port: int, clientId: int, timeout: float = 10
+    ) -> None:
+        if int(clientId) == 0:
+            raise ValueError("IBKR clientId must be non-zero")
+        self.wrapper.clientId = int(clientId)
+        try:
+            await self.client.connectAsync(host, port, int(clientId), timeout)
+            if not self.client.isReady():
+                raise ConnectionError("Socket connection broken while connecting")
+            self.connectedEvent.emit()
+        except BaseException:
+            self.disconnect()
+            raise
+
+    def _onError(self, _req_id, _error_code, _error_string, _contract) -> None:
+        # In particular, do not inherit IB._onError's code-1102 account-summary
+        # resubscription. Market-data requests are explicitly retried or failed.
+        return None
+
+    async def reqHistoricalDataStrictAsync(
+        self, contract: "Contract", *, endDateTime: Any, durationStr: str,
+        barSizeSetting: str, whatToShow: str, useRTH: bool, formatDate: int,
+        timeout: float,
+    ) -> Any:
+        req_id = self.client.getReqId()
+        bars = BarDataList()
+        bars.reqId = req_id
+        bars.contract = contract
+        bars.endDateTime = endDateTime
+        bars.durationStr = durationStr
+        bars.barSizeSetting = barSizeSetting
+        bars.whatToShow = whatToShow
+        bars.useRTH = useRTH
+        bars.formatDate = formatDate
+        bars.keepUpToDate = False
+        bars.chartOptions = []
+        future = self.wrapper.startReq(req_id, contract, container=bars)
+        self.client.reqHistoricalData(
+            req_id, contract, ib_util.formatIBDatetime(endDateTime), durationStr,
+            barSizeSetting, whatToShow, useRTH, formatDate, False, [],
+        )
+        try:
+            await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            self.client.cancelHistoricalData(req_id)
+            self.wrapper._endReq(req_id, success=False)
+            raise
+        return bars
+
+    async def reqHeadTimeStampStrictAsync(
+        self, contract: "Contract", *, whatToShow: str, useRTH: bool,
+        timeout: float,
+    ) -> Any:
+        req_id = self.client.getReqId()
+        future = self.wrapper.startReq(req_id, contract)
+        self.client.reqHeadTimeStamp(req_id, contract, whatToShow, useRTH, 2)
+        try:
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            self.client.cancelHeadTimeStamp(req_id)
+            self.wrapper._endReq(req_id, success=False)
+
+
+class MarketDataIBAdapter:
+    """Narrow facade: connection, contract details, head time, history only."""
+
+    readonly = True
+    startup_fetch = StartupFetchNONE
+
+    def __init__(self, engine: Optional[_MarketDataIB] = None):
+        self._engine = engine or _MarketDataIB()
+        self._engine.RaiseRequestErrors = True
+        self.host = ""
+        self.port = 0
+        self.client_id = 0
+
+    def connect(self, host: str, port: int, client_id: int, timeout: float = 10):
+        if client_id == 0:
+            raise ValueError("IBKR clientId must be non-zero")
+        self.host, self.port, self.client_id = host, port, client_id
+        self._engine._run(
+            self._engine.connectAsync(host, port, clientId=client_id, timeout=timeout)
+        )
+        return self
+
+    def disconnect(self) -> None:
+        self._engine.disconnect()
+
+    def isConnected(self) -> bool:
+        return self._engine.isConnected()
+
+    def sleep(self, seconds: float) -> None:
+        self._engine.sleep(seconds)
+
+    def reqContractDetails(self, contract: "Contract") -> Any:
+        return self._engine.reqContractDetails(contract)
+
+    def reqHeadTimeStamp(
+        self, contract: "Contract", whatToShow: str, useRTH: bool, timeout: float = 30
+    ) -> Any:
+        return self._engine._run(
+            self._engine.reqHeadTimeStampStrictAsync(
+                contract, whatToShow=whatToShow, useRTH=useRTH, timeout=timeout
+            )
+        )
+
+    def reqHistoricalData(self, contract: "Contract", **kwargs) -> Any:
+        return self._engine._run(
+            self._engine.reqHistoricalDataStrictAsync(contract, **kwargs)
+        )
+
+
+def _clamp_ib_async_logging() -> None:
+    for logger_name in ("ib_async.client", "ib_async.wrapper", "ib_async.ib"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+
+def ib_connect(host: str, port: int, client_id: int) -> MarketDataIBAdapter:
+    _clamp_ib_async_logging()
+    return MarketDataIBAdapter().connect(host, port, client_id, timeout=10)
 
 def ib_connect_with_retries(
     host: str, port: int, client_id: int, retries: int, sleep_sec: float
 ) -> "IB":
     return _call_ib_with_retries(
-        lambda: ib_connect(host, port, client_id), retries, sleep_sec
+        lambda: ib_connect(host, port, client_id), retries, sleep_sec,
+        retry_connection=True,
     )
 
 # ---------- interval range sanity check ----------
@@ -909,13 +1111,7 @@ def _run_with_source(args: argparse.Namespace, tickers: List[str],
                     resolved, details = resolve_ib_contract(
                         ib, t, contract_map, args.ib_retries, args.sleep
                     )
-                    identity = (
-                        f"symbol={resolved.symbol} localSymbol={getattr(resolved, 'localSymbol', '')} "
-                        f"conId={resolved.conId} secType={resolved.secType} "
-                        f"exchange={resolved.exchange} "
-                        f"primaryExchange={getattr(resolved, 'primaryExchange', '')} "
-                        f"currency={resolved.currency} longName={getattr(details, 'longName', '')}"
-                    )
+                    identity = _format_ib_validation_identity(resolved, details)
                     valid.append((t, identity, resolved.exchange or ""))
                 except Exception as e:
                     invalid.append((t, str(e)))
@@ -1034,11 +1230,16 @@ def _run_with_source(args: argparse.Namespace, tickers: List[str],
             expected_con_id = (
                 provenance[t]["ibkr"]["conId"] if t in provenance else None
             )
-            results.append(fetch_one_ibkr(
+            result = fetch_one_ibkr(
                 ib, t, fetch_plan[t][0], args.end, args.interval, args.adjust,
                 limiter, contract_map, args.ib_use_rth, args.ib_retries, args.sleep,
                 expected_con_id,
-            ))
+            )
+            if result[2] and result[2].startswith("RETRYABLE_CONNECTION:"):
+                raise RuntimeError(
+                    f"{t}: {result[2]}; connection closed, rerun after TWS/IB Gateway recovery"
+                )
+            results.append(result)
     else:
         with cf.ThreadPoolExecutor(max_workers=max(1, args.threads)) as ex:
             futures = [

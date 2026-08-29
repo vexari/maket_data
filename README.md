@@ -94,8 +94,9 @@ subject to Yahoo's rate-limiting, and it can reach some symbols/exchanges Yahoo 
 - TWS or IB Gateway running and **logged in**
 - API access enabled: *File → Global Configuration → API → Settings → Enable ActiveX and Socket Clients*
 - TWS / IB Gateway **Read-Only API** setting enabled. The client also connects
-  with `readonly=True` and `StartupFetchNONE`; this code-side defense does not
-  replace the gateway setting.
+  through a narrow market-data facade whose lifecycle performs no account,
+  portfolio, position, order, execution, or PnL request. This code-side defense
+  does not replace the gateway setting.
 - Prefer localhost or a tightly controlled trusted IP.
 - A dedicated, non-zero client ID.
 - Market data subscriptions for whatever exchanges you're requesting
@@ -157,6 +158,24 @@ Live validation is still required before trusting this pipeline. A later,
 separate read-only TWS validation must compare resolved identity and historical
 bars for representative US, TASE, and SPX instruments; no account values belong
 in validation output.
+
+TWS necessarily sends managed-account identifiers during the initial API
+protocol handshake. The collector cannot prevent those bytes from arriving,
+but its wrapper immediately discards the callback: identifiers are not cached,
+used by application logic, printed, logged, persisted, or included in
+validation/provenance output. Before connecting, the collector clamps
+`ib_async.client`, `ib_async.wrapper`, and `ib_async.ib` logging to `WARNING` to
+prevent INFO/DEBUG wire or state diagnostics from exposing handshake or broker
+state. Connectivity-restored code 1102 does not trigger account-summary
+resubscription.
+
+Historical requests use collector-owned futures and timeouts. A timeout
+cancels the exact IBKR request and is classified `RETRYABLE_TIMEOUT`; it is not
+treated as an empty/no-history response. Connection loss fails closed as
+`RETRYABLE_CONNECTION` for operator action rather than retrying against a dead
+object. Pacing/timeout backoff while connected uses the library event-loop-safe
+sleep mechanism. Head timestamps provide a known earliest-history boundary so
+empty weekend/holiday pages move backward instead of terminating pagination.
 
 ### Validation
 
@@ -234,6 +253,9 @@ This will:
 - Yahoo may lag a few minutes after market close before publishing today’s bar.  
 - Use `--include-today` only after the market is closed; otherwise you may capture an incomplete candle (script will warn).  
 - Tickers that don’t exist on Yahoo (e.g., delisted or wrong symbol) will be logged as failed.  
+- Yahoo `1d`, `5d`, `1wk`, `1mo`, and `3mo` provenance uses
+  `calendar_date`: the index is a source calendar/period label, not a UTC
+  midnight instant.
 
 ---
 

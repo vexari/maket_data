@@ -1,6 +1,9 @@
 import argparse
+import asyncio
 import datetime as dt
+import io
 import json
+import logging
 import os
 import tempfile
 import unittest
@@ -15,12 +18,14 @@ import get_stock_data as app
 
 
 class FakeIB:
-    def __init__(self, details=None, bars=None, historical_effects=None):
+    def __init__(self, details=None, bars=None, historical_effects=None, head=None):
         self.details = details or []
         self.bars = bars or []
         self.historical_effects = list(historical_effects or [])
         self.candidates = []
         self.historical_calls = []
+        self.head = head
+        self.sleep_calls = []
 
     def reqContractDetails(self, candidate):
         self.candidates.append(candidate)
@@ -34,6 +39,15 @@ class FakeIB:
                 raise effect
             return effect
         return self.bars
+
+    def reqHeadTimeStamp(self, contract, **kwargs):
+        if self.head is not None:
+            return self.head
+        dates = [item.date for item in self.bars]
+        return min(dates) if dates else dt.datetime(2025, 1, 2, tzinfo=dt.timezone.utc)
+
+    def sleep(self, seconds):
+        self.sleep_calls.append(seconds)
 
 
 def resolved_detail(
@@ -69,6 +83,20 @@ class PathAndProvenanceTests(unittest.TestCase):
     def test_ibkr_path_is_isolated(self):
         self.assertEqual(
             app.output_path(self.args("ibkr"), "AAPL"), "history/ibkr/AAPL.csv"
+        )
+
+    def test_yfinance_period_intervals_use_calendar_labels(self):
+        for interval in ("1d", "5d", "1wk", "1mo", "3mo"):
+            args = self.args()
+            args.interval = interval
+            self.assertEqual(
+                app._base_metadata(args, "AAPL")["time_semantics"],
+                "calendar_date",
+            )
+        args = self.args()
+        args.interval = "1h"
+        self.assertEqual(
+            app._base_metadata(args, "AAPL")["time_semantics"], "utc_instant"
         )
 
     def _dataset(self, root, source="yfinance", **changes):
@@ -252,12 +280,111 @@ class TimeAndRequestTests(unittest.TestCase):
         self.assertIn("timezone-naive", fetched[2])
 
 
+class PaginationTests(unittest.TestCase):
+    mapping = app.load_ib_contract_map(None)
+    friday = dt.datetime(2025, 1, 3, 5, tzinfo=dt.timezone.utc)
+    monday = dt.datetime(2025, 1, 6, 5, tzinfo=dt.timezone.utc)
+
+    def _fetch(self, effects, start="2025-01-03", head=None):
+        ib = FakeIB(
+            [resolved_detail()], historical_effects=effects,
+            head=head or self.friday,
+        )
+        result = app.fetch_one_ibkr(
+            ib, "AAPL", start, "2025-01-06", "1m", False,
+            app.RateLimiter(0), self.mapping, True, 0, 0,
+        )
+        return result, ib
+
+    def test_one_minute_paging_crosses_weekend_and_duplicate_boundary(self):
+        result, ib = self._fetch([
+            [bar(self.monday)], [bar(self.monday)], [], [bar(self.friday)],
+        ])
+        self.assertIsNone(result[2], result[2])
+        self.assertEqual(len(result[1]), 2)
+        self.assertEqual(len(ib.historical_calls), 4)
+
+    def test_multi_day_holiday_gap_is_crossed(self):
+        prior = dt.datetime(2024, 12, 31, 5, tzinfo=dt.timezone.utc)
+        ib = FakeIB(
+            [resolved_detail()],
+            historical_effects=[
+                [bar(self.monday)], [bar(self.monday)], [], [], [], [bar(prior)],
+            ],
+            head=prior,
+        )
+        result = app.fetch_one_ibkr(
+            ib, "AAPL", "2024-12-31", "2025-01-06", "1m", False,
+            app.RateLimiter(0), self.mapping, True, 0, 0,
+        )
+        self.assertIsNone(result[2], result[2])
+        self.assertEqual(len(result[1]), 2)
+
+    def test_known_earliest_history_boundary_terminates_cleanly(self):
+        result, _ = self._fetch(
+            [[bar(self.monday)], [], [], [bar(self.friday)]],
+            start="2020-01-01", head=self.friday,
+        )
+        self.assertIsNone(result[2], result[2])
+        self.assertEqual(result[1].index.min(), pd.Timestamp(self.friday))
+
+    def test_page_cap_fails_closed(self):
+        ancient = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+        with mock.patch.object(app, "_IB_PAGE_CAP", 2):
+            result, _ = self._fetch([[], []], start="2025-01-03", head=ancient)
+        self.assertIn("PERMANENT_PAGE_CAP", result[2])
+
+
+class HistoricalFailureBoundaryTests(unittest.TestCase):
+    mapping = app.load_ib_contract_map(None)
+    instant = dt.datetime(2025, 1, 2, 5, tzinfo=dt.timezone.utc)
+
+    def _failure(self, effect):
+        ib = FakeIB(
+            [resolved_detail()], historical_effects=[effect], head=self.instant
+        )
+        return app.fetch_one_ibkr(
+            ib, "AAPL", "2025-01-02", "2025-01-02", "1m", False,
+            app.RateLimiter(0), self.mapping, True, 0, 0,
+        )
+
+    def test_timeout_is_retryable_not_no_data(self):
+        result = self._failure(TimeoutError("owned request timeout"))
+        self.assertIn("RETRYABLE_TIMEOUT", result[2])
+        self.assertNotIn("NO_HISTORICAL_DATA", result[2])
+
+    def test_deterministic_empty_is_no_historical_data(self):
+        result = self._failure([])
+        self.assertIn("PERMANENT_NO_HISTORICAL_DATA", result[2])
+
+    def test_entitlement_is_permanent_entitlement(self):
+        result = self._failure(
+            app.RequestError(1, 162, "No market data permissions for request")
+        )
+        self.assertIn("PERMANENT_NO_ENTITLEMENT", result[2])
+
+    def test_invalid_request_is_permanent_request(self):
+        result = self._failure(app.RequestError(1, 200, "invalid contract"))
+        self.assertIn("PERMANENT_REQUEST", result[2])
+
+
 class RetryAndConnectionTests(unittest.TestCase):
     def test_retry_classification(self):
-        self.assertTrue(app.classify_ib_error(TimeoutError("bounded timeout")).retryable)
+        timeout = app.classify_ib_error(TimeoutError("bounded timeout"))
+        self.assertEqual(timeout.category, "RETRYABLE_TIMEOUT")
         permanent = app.classify_ib_error(app.RequestError(1, 354, "not subscribed"))
         self.assertFalse(permanent.retryable)
         self.assertEqual(permanent.category, "PERMANENT_NO_ENTITLEMENT")
+        permission_162 = app.classify_ib_error(
+            app.RequestError(1, 162, "No market data permissions")
+        )
+        self.assertEqual(permission_162.category, "PERMANENT_NO_ENTITLEMENT")
+        no_data = app.classify_ib_error(
+            app.RequestError(1, 162, "HMDS query returned no data")
+        )
+        self.assertEqual(no_data.category, "PERMANENT_NO_HISTORICAL_DATA")
+        invalid = app.classify_ib_error(app.RequestError(1, 200, "invalid contract"))
+        self.assertEqual(invalid.category, "PERMANENT_REQUEST")
 
     def test_bounded_retry_count(self):
         calls = []
@@ -268,18 +395,86 @@ class RetryAndConnectionTests(unittest.TestCase):
             app._call_ib_with_retries(fail, retries=2, sleep_sec=0)
         self.assertEqual(len(calls), 3)
 
-    def test_connection_is_readonly_and_minimal(self):
-        instance = SimpleNamespace(RaiseRequestErrors=False)
-        instance.connect = mock.Mock()
-        with mock.patch.object(app, "IB", return_value=instance):
-            self.assertIs(app.ib_connect("127.0.0.1", 7497, 42), instance)
-        self.assertTrue(instance.RaiseRequestErrors)
-        instance.connect.assert_called_once_with(
-            "127.0.0.1", 7497, clientId=42, timeout=10, readonly=True,
-            fetchFields=app.StartupFetchNONE,
+    def test_market_data_connect_lifecycle_invokes_no_forbidden_requests(self):
+        engine = app._MarketDataIB()
+        client = SimpleNamespace(
+            connectAsync=mock.AsyncMock(),
+            isReady=mock.Mock(return_value=True),
+            isConnected=mock.Mock(return_value=False),
+            disconnect=mock.Mock(),
         )
-        with self.assertRaisesRegex(ValueError, "non-zero"):
-            app.ib_connect("127.0.0.1", 7497, 0)
+        engine.client = client
+        forbidden = (
+            "reqPositionsAsync", "reqAccountUpdatesAsync",
+            "reqAccountUpdatesMultiAsync", "reqAccountSummaryAsync",
+            "reqExecutionsAsync", "reqOpenOrdersAsync", "reqAllOpenOrders",
+            "reqCompletedOrdersAsync", "reqPnLAsync", "reqPnLSingleAsync",
+        )
+        spies = {}
+        for name in forbidden:
+            spies[name] = mock.Mock()
+            setattr(engine, name, spies[name])
+        asyncio.run(engine.connectAsync("127.0.0.1", 7497, 42, 10))
+        client.connectAsync.assert_awaited_once_with("127.0.0.1", 7497, 42, 10)
+        for spy in spies.values():
+            spy.assert_not_called()
+
+        adapter = app.MarketDataIBAdapter(engine)
+        self.assertTrue(adapter.readonly)
+        self.assertEqual(adapter.startup_fetch, app.StartupFetchNONE)
+        for name in forbidden:
+            self.assertFalse(hasattr(adapter, name))
+
+    def test_error_1102_does_not_request_account_summary(self):
+        engine = app._MarketDataIB()
+        summary = mock.Mock()
+        engine.reqAccountSummaryAsync = summary
+        engine._onError(-1, 1102, "restored", None)
+        summary.assert_not_called()
+
+    def test_managed_account_ids_are_discarded_and_never_form_output(self):
+        engine = app._MarketDataIB()
+        self.assertEqual(engine.wrapper.accounts, [])
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr, \
+             mock.patch.object(logging.Logger, "_log") as logger:
+            engine.wrapper.managedAccounts("DU_SENSITIVE_123")
+        self.assertEqual(engine.wrapper.accounts, [])
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+        logger.assert_not_called()
+        detail = resolved_detail()
+        identity = app._format_ib_validation_identity(detail.contract, detail)
+        metadata = app._ib_metadata(
+            "AAPL", "1d", False, "2025-01-01", "2025-01-02",
+            detail.contract, detail, "TRADES", True,
+        )
+        self.assertNotIn("DU_SENSITIVE_123", identity)
+        self.assertNotIn("DU_SENSITIVE_123", json.dumps(metadata))
+
+    def test_dependency_logging_is_clamped(self):
+        app._clamp_ib_async_logging()
+        for name in ("ib_async.client", "ib_async.wrapper", "ib_async.ib"):
+            self.assertGreaterEqual(logging.getLogger(name).level, logging.WARNING)
+
+    def test_historical_timeout_cancels_request_and_removes_future(self):
+        async def scenario():
+            engine = app._MarketDataIB()
+            engine.client = SimpleNamespace(
+                getReqId=mock.Mock(return_value=77),
+                reqHistoricalData=mock.Mock(),
+                cancelHistoricalData=mock.Mock(),
+                isConnected=mock.Mock(return_value=False),
+            )
+            with self.assertRaises(asyncio.TimeoutError):
+                await engine.reqHistoricalDataStrictAsync(
+                    app.Contract(conId=101), endDateTime="", durationStr="1 D",
+                    barSizeSetting="1 min", whatToShow="TRADES", useRTH=True,
+                    formatDate=2, timeout=0.001,
+                )
+            engine.client.cancelHistoricalData.assert_called_once_with(77)
+            self.assertNotIn(77, engine.wrapper._futures)
+        asyncio.run(scenario())
 
     def test_connection_retries_keep_the_same_identity(self):
         connected = object()
@@ -293,6 +488,29 @@ class RetryAndConnectionTests(unittest.TestCase):
             mock.call("127.0.0.1", 7497, 42),
             mock.call("127.0.0.1", 7497, 42),
         ])
+
+    def test_connected_request_backoff_uses_adapter_sleep(self):
+        calls = []
+        sleeps = []
+        def request():
+            calls.append(1)
+            if len(calls) < 2:
+                raise TimeoutError("temporary")
+            return "ok"
+        result = app._call_ib_with_retries(
+            request, 2, 0.25, sleep_fn=sleeps.append
+        )
+        self.assertEqual(result, "ok")
+        self.assertEqual(sleeps, [0.25])
+
+    def test_connection_loss_fails_closed_without_same_object_retry(self):
+        calls = []
+        def request():
+            calls.append(1)
+            raise ConnectionError("socket lost")
+        with self.assertRaisesRegex(RuntimeError, "RETRYABLE_CONNECTION"):
+            app._call_ib_with_retries(request, 2, 0, sleep_fn=lambda _: None)
+        self.assertEqual(len(calls), 1)
 
     def test_include_today_is_source_specific(self):
         args = argparse.Namespace(source="ibkr", include_today=True)
@@ -308,7 +526,8 @@ class StaticSafetyBoundaryTests(unittest.TestCase):
         forbidden = (
             "placeOrder", "cancelOrder", "modifyOrder", "exerciseOptions",
             "whatIfOrder", "reqPositions", "reqAccountUpdates",
-            "reqExecutions", "reqOpenOrders", "reqCompletedOrders",
+            "reqAccountSummary", "reqExecutions", "reqOpenOrders",
+            "reqAllOpenOrders", "reqCompletedOrders", "reqPnL", "reqPnLSingle",
         )
         for api_name in forbidden:
             self.assertNotIn(api_name, source)

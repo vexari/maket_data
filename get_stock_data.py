@@ -733,6 +733,33 @@ def _enforce_full_history(metadata: Dict[str, Any], required: bool) -> None:
     if required and metadata.get("coverage", {}).get("status") == "provider_limited":
         raise ValueError("PROVIDER_LIMITED: --require-full-history prevents dataset write")
 
+def _append_dataset_requested_start(
+    existing_metadata: Dict[str, Any], cli_requested_start: str,
+) -> str:
+    existing_start = existing_metadata.get("requested_start")
+    if not isinstance(existing_start, str):
+        raise ValueError("existing provenance has no valid requested_start")
+    existing_date = dt.date.fromisoformat(existing_start)
+    cli_date = dt.date.fromisoformat(cli_requested_start)
+    if cli_date < existing_date:
+        raise ValueError(
+            "append --start is earlier than the existing dataset requested_start "
+            f"({cli_requested_start} < {existing_start}); use --overwrite to create "
+            "a new historical coverage contract"
+        )
+    return existing_start
+
+def _finalize_dataset_metadata(
+    metadata: Dict[str, Any], frame: pd.DataFrame, dataset_requested_start: str,
+    requested_end: str, existing_metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    metadata["requested_start"] = dataset_requested_start
+    metadata["requested_end"] = requested_end
+    if metadata.get("source") == "ibkr":
+        _update_ib_coverage(
+            metadata, frame, dataset_requested_start, existing_metadata
+        )
+
 def _calendar_request_end(cursor: dt.date, timezone: ZoneInfo) -> dt.datetime:
     return dt.datetime.combine(cursor, dt.time(23, 59, 59), timezone)
 
@@ -1336,6 +1363,7 @@ def _run_with_source(args: argparse.Namespace, tickers: List[str],
     tickers_to_fetch: List[str] = []
     skipped: List[str] = []
     provenance: Dict[str, Dict[str, Any]] = {}
+    dataset_requested_starts: Dict[str, str] = {}
     what_to_show = "ADJUSTED_LAST" if args.adjust else "TRADES"
 
     for t in tickers:
@@ -1356,6 +1384,7 @@ def _run_with_source(args: argparse.Namespace, tickers: List[str],
             continue
 
         eff_start = args.start
+        dataset_requested_starts[t] = args.start
         df_old = None
         if exists and args.append:
             try:
@@ -1365,6 +1394,12 @@ def _run_with_source(args: argparse.Namespace, tickers: List[str],
                     what_to_show=what_to_show if args.source == "ibkr" else None,
                 )
             except ValueError as exc:
+                raise RuntimeError(f"PROVENANCE_FAILURE: {t}: {exc}") from exc
+            try:
+                dataset_requested_starts[t] = _append_dataset_requested_start(
+                    provenance[t], args.start
+                )
+            except (TypeError, ValueError) as exc:
                 raise RuntimeError(f"PROVENANCE_FAILURE: {t}: {exc}") from exc
             df_old = load_existing(out_path, args.format)
             if df_old is None:
@@ -1432,8 +1467,6 @@ def _run_with_source(args: argparse.Namespace, tickers: List[str],
             continue
 
         metadata = fetched_metadata or _base_metadata(args, ticker)
-        metadata["requested_start"] = args.start
-        metadata["requested_end"] = args.end
         if args.append and args.source == "ibkr" and ticker in provenance:
             try:
                 validate_ib_append_identity(provenance[ticker], metadata)
@@ -1450,15 +1483,16 @@ def _run_with_source(args: argparse.Namespace, tickers: List[str],
             added = len(output_frame) - (0 if df_old is None else len(df_old))
             write_suffix = f" (appended {max(0, added)} new rows)"
 
+        _finalize_dataset_metadata(
+            metadata, output_frame, dataset_requested_starts[ticker], args.end,
+            provenance.get(ticker),
+        )
         if args.source == "ibkr":
-            _update_ib_coverage(
-                metadata, output_frame, args.start, provenance.get(ticker)
-            )
             coverage = metadata["coverage"]
             if coverage["status"] == "provider_limited":
                 message = (
                     f"{ticker}: provider history begins at {coverage['provider_head']}, "
-                    f"after requested start {args.start}"
+                    f"after dataset requested start {metadata['requested_start']}"
                 )
                 try:
                     _enforce_full_history(

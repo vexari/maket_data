@@ -155,7 +155,11 @@ Append fails on missing/invalid metadata, changed source/ticker/interval/
 adjustment/RTH/what-to-show, changed `conId`, or a data hash mismatch. A legacy
 Yahoo file may still be skipped normally, but cannot be appended until one
 `--overwrite` establishes trusted metadata. There is no automatic source
-fallback or automatic contract migration.
+fallback or automatic contract migration. Append preserves the existing
+dataset-level `requested_start` even when the command uses a later start for
+its trailing fetch window, so provider-limited history cannot become falsely
+complete. An append start earlier than the trusted dataset baseline fails and
+requires `--overwrite` to establish a new historical coverage contract.
 
 Daily/weekly/monthly IBKR bars retain calendar-date semantics. Intraday IBKR
 requests use `formatDate=2`, retain timezone-aware UTC instants, and interpret

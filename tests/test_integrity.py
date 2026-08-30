@@ -337,6 +337,41 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(fetched["coverage"]["provider_head"], "2015-01-02")
         self.assertEqual(fetched["coverage"]["status"], "provider_limited")
 
+    def test_later_append_start_preserves_provider_limited_dataset_baseline(self):
+        old = pd.DataFrame({"Close": [1]}, index=pd.to_datetime(["2015-01-02"]))
+        trailing = pd.DataFrame({"Close": [2]}, index=pd.to_datetime(["2025-06-01"]))
+        merged = app.align_and_merge(old, trailing)
+        existing = self._metadata(dt.date(2015, 1, 2))
+        app._update_ib_coverage(existing, old, "2000-01-01")
+        fetched = self._metadata(dt.date(2015, 1, 2))
+
+        dataset_start = app._append_dataset_requested_start(existing, "2020-01-01")
+        app._finalize_dataset_metadata(
+            fetched, merged, dataset_start, "2025-06-02", existing
+        )
+
+        self.assertEqual(dataset_start, "2000-01-01")
+        self.assertEqual(fetched["requested_start"], "2000-01-01")
+        self.assertEqual(fetched["requested_end"], "2025-06-02")
+        self.assertEqual(fetched["coverage"], {
+            "status": "provider_limited", "provider_head": "2015-01-02",
+            "actual_start": "2015-01-02", "actual_end": "2025-06-01",
+        })
+        with self.assertRaisesRegex(ValueError, "PROVIDER_LIMITED"):
+            app._enforce_full_history(fetched, True)
+
+    def test_earlier_append_start_fails_closed(self):
+        existing = self._metadata(dt.date(2015, 1, 2))
+        with self.assertRaisesRegex(ValueError, "use --overwrite"):
+            app._append_dataset_requested_start(existing, "1999-01-01")
+
+    def test_same_append_start_preserves_baseline(self):
+        existing = self._metadata(dt.date(2015, 1, 2))
+        self.assertEqual(
+            app._append_dataset_requested_start(existing, "2000-01-01"),
+            "2000-01-01",
+        )
+
 
 class PaginationTests(unittest.TestCase):
     mapping = app.load_ib_contract_map(None)

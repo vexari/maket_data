@@ -224,7 +224,7 @@ class ContractTests(unittest.TestCase):
             {
                 "schema_version", "source", "requested_ticker", "interval",
                 "adjusted", "requested_start", "requested_end", "fetched_at_utc",
-                "data_sha256", "time_semantics", "ibkr",
+                "data_sha256", "time_semantics", "coverage", "ibkr",
             },
         )
         self.assertEqual(
@@ -278,6 +278,64 @@ class TimeAndRequestTests(unittest.TestCase):
             app.RateLimiter(0), {}, True, 0, 0,
         )
         self.assertIn("timezone-naive", fetched[2])
+
+    def test_calendar_request_uses_instrument_timezone(self):
+        expected = {
+            "America/New_York": "20250103 04:59:59 UTC",
+            "Asia/Jerusalem": "20250102 21:59:59 UTC",
+            "Australia/Sydney": "20250102 12:59:59 UTC",
+        }
+        for timezone_id, formatted in expected.items():
+            detail = resolved_detail(timezone=timezone_id)
+            ib = FakeIB([detail], [bar(dt.date(2025, 1, 2))])
+            result = app.fetch_one_ibkr(
+                ib, "AAPL", "2025-01-02", "2025-01-02", "1d", False,
+                app.RateLimiter(0), {}, True, 0, 0,
+            )
+            self.assertIsNone(result[2], result[2])
+            boundary = ib.historical_calls[0][1]["endDateTime"]
+            self.assertEqual(boundary.tzinfo, ZoneInfo(timezone_id))
+            self.assertEqual(app.ib_util.formatIBDatetime(boundary), formatted)
+
+
+class CoverageTests(unittest.TestCase):
+    def _metadata(self, provider_head):
+        detail = resolved_detail()
+        return app._ib_metadata(
+            "AAPL", "1d", False, "2000-01-01", "2025-01-02",
+            detail.contract, detail, "TRADES", True, provider_head,
+        )
+
+    def test_provider_limited_and_complete_coverage(self):
+        frame = pd.DataFrame(
+            {"Close": [1, 2]}, index=pd.to_datetime(["2015-01-02", "2025-01-02"])
+        )
+        limited = self._metadata(dt.date(2015, 1, 2))
+        app._update_ib_coverage(limited, frame, "2000-01-01")
+        self.assertEqual(limited["coverage"], {
+            "status": "provider_limited", "provider_head": "2015-01-02",
+            "actual_start": "2015-01-02",
+            "actual_end": "2025-01-02",
+        })
+        with self.assertRaisesRegex(ValueError, "PROVIDER_LIMITED"):
+            app._enforce_full_history(limited, True)
+
+        complete = self._metadata(dt.date(1999, 12, 31))
+        app._update_ib_coverage(complete, frame, "2015-01-02")
+        self.assertEqual(complete["coverage"]["status"], "complete")
+        app._enforce_full_history(complete, True)
+
+    def test_append_coverage_uses_complete_merged_dataset(self):
+        old = pd.DataFrame({"Close": [1]}, index=pd.to_datetime(["2015-01-02"]))
+        trailing = pd.DataFrame({"Close": [2]}, index=pd.to_datetime(["2025-01-02"]))
+        merged = app.align_and_merge(old, trailing)
+        existing = self._metadata(dt.date(2015, 1, 2))
+        fetched = self._metadata(None)
+        app._update_ib_coverage(fetched, merged, "2000-01-01", existing)
+        self.assertEqual(fetched["coverage"]["actual_start"], "2015-01-02")
+        self.assertEqual(fetched["coverage"]["actual_end"], "2025-01-02")
+        self.assertEqual(fetched["coverage"]["provider_head"], "2015-01-02")
+        self.assertEqual(fetched["coverage"]["status"], "provider_limited")
 
 
 class PaginationTests(unittest.TestCase):
@@ -385,6 +443,10 @@ class RetryAndConnectionTests(unittest.TestCase):
         self.assertEqual(no_data.category, "PERMANENT_NO_HISTORICAL_DATA")
         invalid = app.classify_ib_error(app.RequestError(1, 200, "invalid contract"))
         self.assertEqual(invalid.category, "PERMANENT_REQUEST")
+        sensitive = app.classify_ib_error(
+            app.RequestError(1, 200, "request rejected for DU_SENSITIVE_123")
+        )
+        self.assertNotIn("DU_SENSITIVE_123", sensitive.message)
 
     def test_bounded_retry_count(self):
         calls = []
@@ -402,6 +464,7 @@ class RetryAndConnectionTests(unittest.TestCase):
             isReady=mock.Mock(return_value=True),
             isConnected=mock.Mock(return_value=False),
             disconnect=mock.Mock(),
+            _accounts=["DU_HANDSHAKE_ONLY"],
         )
         engine.client = client
         forbidden = (
@@ -416,6 +479,8 @@ class RetryAndConnectionTests(unittest.TestCase):
             setattr(engine, name, spies[name])
         asyncio.run(engine.connectAsync("127.0.0.1", 7497, 42, 10))
         client.connectAsync.assert_awaited_once_with("127.0.0.1", 7497, 42, 10)
+        self.assertEqual(client._accounts, [])
+        engine._assert_market_data_only_state()
         for spy in spies.values():
             spy.assert_not_called()
 
@@ -455,7 +520,9 @@ class RetryAndConnectionTests(unittest.TestCase):
     def test_dependency_logging_is_clamped(self):
         app._clamp_ib_async_logging()
         for name in ("ib_async.client", "ib_async.wrapper", "ib_async.ib"):
-            self.assertGreaterEqual(logging.getLogger(name).level, logging.WARNING)
+            logger = logging.getLogger(name)
+            self.assertTrue(logger.disabled)
+            self.assertFalse(logger.propagate)
 
     def test_historical_timeout_cancels_request_and_removes_future(self):
         async def scenario():
@@ -520,17 +587,224 @@ class RetryAndConnectionTests(unittest.TestCase):
         self.assertIn("unsupported", logger.call_args.args[0])
 
 
-class StaticSafetyBoundaryTests(unittest.TestCase):
-    def test_application_references_no_trading_api(self):
-        source = Path(app.__file__).read_text(encoding="utf-8")
-        forbidden = (
-            "placeOrder", "cancelOrder", "modifyOrder", "exerciseOptions",
-            "whatIfOrder", "reqPositions", "reqAccountUpdates",
-            "reqAccountSummary", "reqExecutions", "reqOpenOrders",
-            "reqAllOpenOrders", "reqCompletedOrders", "reqPnL", "reqPnLSingle",
+class MarketDataBoundaryTests(unittest.TestCase):
+    denied_callbacks = (
+        "managedAccounts", "updateAccountValue", "updateAccountTime",
+        "accountSummary", "accountSummaryEnd", "updatePortfolio", "position",
+        "positionEnd", "positionMulti", "positionMultiEnd", "accountUpdateMulti",
+        "accountUpdateMultiEnd", "accountDownloadEnd", "openOrder",
+        "openOrderEnd", "orderStatus", "orderBound", "completedOrder", "completedOrdersEnd",
+        "execDetails", "execDetailsEnd", "commissionReport", "pnl", "pnlSingle",
+    )
+
+    def test_adapter_callable_surface_is_allowlisted(self):
+        allowed = {
+            "connect", "disconnect", "isConnected", "sleep",
+            "reqContractDetails", "reqHeadTimeStamp", "reqHistoricalData",
+        }
+        public_callables = {
+            name for name in dir(app.MarketDataIBAdapter)
+            if not name.startswith("_") and callable(getattr(app.MarketDataIBAdapter, name))
+        }
+        self.assertEqual(public_callables, allowed)
+
+    def test_sensitive_callbacks_are_overridden_and_discard_payloads(self):
+        for name in self.denied_callbacks:
+            self.assertIn(name, app._MarketDataWrapper.__dict__)
+        engine = app._MarketDataIB()
+        sensitive = "DU_SENSITIVE_CALLBACK_987"
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr, \
+             self.assertLogs(level="CRITICAL") as captured:
+            # assertLogs needs one unrelated record; denied callbacks emit none.
+            logging.getLogger("test.boundary").critical("safe sentinel")
+            for name in self.denied_callbacks:
+                getattr(engine.wrapper, name)(sensitive)
+        engine._assert_market_data_only_state()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertNotIn(sensitive, " ".join(captured.output))
+
+    def test_raw_dependency_error_payload_is_not_logged_or_emitted(self):
+        engine = app._MarketDataIB()
+        sensitive = "DU_ERROR_PAYLOAD_654"
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr, \
+             mock.patch.object(logging.Logger, "_log") as logger:
+            engine.wrapper.error(-1, 2104, sensitive, "")
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+        logger.assert_not_called()
+
+
+class StrictRequestTests(unittest.TestCase):
+    def _engine_client(self):
+        engine = app._MarketDataIB()
+        next_id = iter(range(1, 1000))
+        client = SimpleNamespace(
+            getReqId=lambda: next(next_id),
+            reqContractDetails=mock.Mock(),
+            reqHistoricalData=mock.Mock(),
+            cancelHistoricalData=mock.Mock(),
+            reqHeadTimeStamp=mock.Mock(),
+            cancelHeadTimeStamp=mock.Mock(),
+            isConnected=mock.Mock(return_value=False),
+            _accounts=[],
         )
-        for api_name in forbidden:
-            self.assertNotIn(api_name, source)
+        engine.client = client
+        return engine, client
+
+    def test_contract_details_success_and_cleanup(self):
+        async def scenario():
+            engine, client = self._engine_client()
+            detail = resolved_detail()
+            def respond(req_id, _contract):
+                engine.wrapper.contractDetails(req_id, detail)
+                engine.wrapper.contractDetailsEnd(req_id)
+            client.reqContractDetails.side_effect = respond
+            result = await engine.reqContractDetailsStrictAsync(
+                app.Contract(symbol="AAPL"), timeout=1
+            )
+            self.assertEqual(result, [detail])
+            self.assertEqual(engine.wrapper._futures, {})
+            self.assertEqual(engine.wrapper._results, {})
+        asyncio.run(scenario())
+
+    def test_contract_details_request_error_and_cleanup(self):
+        async def scenario():
+            engine, client = self._engine_client()
+            client.reqContractDetails.side_effect = lambda req_id, _contract: (
+                engine.wrapper.error(req_id, 200, "invalid contract", "")
+            )
+            with self.assertRaises(app.RequestError):
+                await engine.reqContractDetailsStrictAsync(app.Contract(), timeout=1)
+            self.assertEqual(engine.wrapper._futures, {})
+            self.assertEqual(engine.wrapper._results, {})
+        asyncio.run(scenario())
+
+    def test_contract_timeout_is_bounded_and_late_responses_are_ignored(self):
+        async def scenario():
+            engine, _client = self._engine_client()
+            with self.assertRaises(asyncio.TimeoutError):
+                await engine.reqContractDetailsStrictAsync(app.Contract(), timeout=0.001)
+            self.assertEqual(engine.wrapper._futures, {})
+            self.assertEqual(engine.wrapper._results, {})
+            engine.wrapper.contractDetails(1, resolved_detail())
+            engine.wrapper.contractDetailsEnd(1)
+            self.assertEqual(engine.wrapper._futures, {})
+            self.assertEqual(engine.wrapper._results, {})
+        asyncio.run(scenario())
+
+    def test_contract_retries_are_bounded(self):
+        ib = mock.Mock()
+        ib.reqContractDetails.side_effect = TimeoutError("bounded")
+        ib.sleep = mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, "RETRYABLE_TIMEOUT"):
+            app.resolve_ib_contract(ib, "AAPL", {}, retries=2, sleep_sec=0)
+        self.assertEqual(ib.reqContractDetails.call_count, 3)
+
+    def test_repeated_contract_timeouts_leave_no_request_state(self):
+        async def scenario():
+            engine, _client = self._engine_client()
+            for _ in range(100):
+                with self.assertRaises(asyncio.TimeoutError):
+                    await engine.reqContractDetailsStrictAsync(app.Contract(), timeout=0)
+            self.assertEqual(len(engine.wrapper._futures), 0)
+            self.assertEqual(len(engine.wrapper._results), 0)
+            self.assertEqual(len(engine.wrapper._reqId2Contract), 0)
+        asyncio.run(scenario())
+
+    def test_calendar_boundary_reaches_low_level_client_as_utc(self):
+        expected = {
+            "America/New_York": "20250103 04:59:59 UTC",
+            "Asia/Jerusalem": "20250102 21:59:59 UTC",
+            "Australia/Sydney": "20250102 12:59:59 UTC",
+        }
+        async def one(timezone_id, formatted):
+            engine, client = self._engine_client()
+            def finish(req_id, *_args):
+                engine.wrapper.historicalDataEnd(req_id, "", "")
+            client.reqHistoricalData.side_effect = finish
+            boundary = app._calendar_request_end(
+                dt.date(2025, 1, 2), ZoneInfo(timezone_id)
+            )
+            await engine.reqHistoricalDataStrictAsync(
+                app.Contract(), endDateTime=boundary, durationStr="1 D",
+                barSizeSetting="1 day", whatToShow="TRADES", useRTH=True,
+                formatDate=1, timeout=1,
+            )
+            self.assertEqual(client.reqHistoricalData.call_args.args[2], formatted)
+            self.assertEqual(engine.wrapper._futures, {})
+            self.assertEqual(engine.wrapper._results, {})
+        async def scenario():
+            for timezone_id, formatted in expected.items():
+                await one(timezone_id, formatted)
+        asyncio.run(scenario())
+
+    def test_head_and_historical_cleanup_on_success_error_and_timeout(self):
+        async def assert_clean(engine):
+            self.assertEqual(engine.wrapper._futures, {})
+            self.assertEqual(engine.wrapper._results, {})
+            self.assertEqual(engine.wrapper._reqId2Contract, {})
+
+        async def scenario():
+            engine, client = self._engine_client()
+            client.reqHeadTimeStamp.side_effect = lambda req_id, *_args: (
+                engine.wrapper.headTimestamp(req_id, "20250102 00:00:00 UTC")
+            )
+            await engine.reqHeadTimeStampStrictAsync(
+                app.Contract(), whatToShow="TRADES", useRTH=True, timeout=1
+            )
+            await assert_clean(engine)
+
+            engine, client = self._engine_client()
+            client.reqHeadTimeStamp.side_effect = lambda req_id, *_args: (
+                engine.wrapper.error(req_id, 200, "invalid", "")
+            )
+            with self.assertRaises(app.RequestError):
+                await engine.reqHeadTimeStampStrictAsync(
+                    app.Contract(), whatToShow="TRADES", useRTH=True, timeout=1
+                )
+            await assert_clean(engine)
+
+            engine, _client = self._engine_client()
+            with self.assertRaises(asyncio.TimeoutError):
+                await engine.reqHeadTimeStampStrictAsync(
+                    app.Contract(), whatToShow="TRADES", useRTH=True,
+                    timeout=0.001,
+                )
+            await assert_clean(engine)
+
+            engine, client = self._engine_client()
+            client.reqHistoricalData.side_effect = lambda req_id, *_args: (
+                engine.wrapper.error(req_id, 200, "invalid", "")
+            )
+            with self.assertRaises(app.RequestError):
+                await engine.reqHistoricalDataStrictAsync(
+                    app.Contract(), endDateTime="", durationStr="1 D",
+                    barSizeSetting="1 day", whatToShow="TRADES", useRTH=True,
+                    formatDate=1, timeout=1,
+                )
+            await assert_clean(engine)
+        asyncio.run(scenario())
+
+    def test_connectivity_codes_fail_or_preserve_active_requests(self):
+        async def scenario():
+            for code in (1100, 1101):
+                engine, _client = self._engine_client()
+                future = engine.wrapper.startReq(44, app.Contract())
+                engine._onError(-1, code, "sensitive ignored", None)
+                with self.assertRaises(ConnectionError):
+                    await future
+                self.assertEqual(engine.wrapper._futures, {})
+                self.assertEqual(engine.wrapper._results, {})
+            engine, _client = self._engine_client()
+            future = engine.wrapper.startReq(45, app.Contract())
+            engine._onError(-1, 1102, "maintained", None)
+            self.assertFalse(future.done())
+            engine._cleanup_request(45)
+            future.cancel()
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":

@@ -493,6 +493,9 @@ def classify_ib_error(exc: BaseException) -> IBFailure:
         r"\1=<redacted>",
         sanitized,
     )
+    sanitized = re.sub(
+        r"(?i)\b(?:DU|DF|U|F)[A-Z0-9_-]{4,}\b", "<account-id-redacted>", sanitized
+    )
     lowered = sanitized.lower()
     if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
         category = "RETRYABLE_TIMEOUT" if isinstance(exc, TimeoutError) else "RETRYABLE_CONNECTION"
@@ -649,6 +652,7 @@ def _calendar_value(value: Any, timezone: ZoneInfo) -> dt.date:
 def _ib_metadata(
     ticker: str, interval: str, adjust: bool, start: str, end: str,
     resolved: "Contract", detail: Any, what_to_show: str, use_rth: bool,
+    provider_head: Any = None,
 ) -> Dict[str, Any]:
     return {
         "schema_version": _METADATA_SCHEMA_VERSION,
@@ -661,6 +665,12 @@ def _ib_metadata(
         "fetched_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "data_sha256": "",
         "time_semantics": _time_semantics("ibkr", interval),
+        "coverage": {
+            "status": "complete",
+            "provider_head": _coverage_value(provider_head),
+            "actual_start": None,
+            "actual_end": None,
+        },
         "ibkr": {
             "conId": resolved.conId,
             "symbol": resolved.symbol,
@@ -675,6 +685,56 @@ def _ib_metadata(
             "useRTH": use_rth,
         },
     }
+
+def _coverage_value(value: Any, calendar: bool = False) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, dt.date) and not isinstance(value, dt.datetime):
+        return value.isoformat()
+    timestamp = pd.Timestamp(value)
+    return timestamp.date().isoformat() if calendar else timestamp.isoformat()
+
+def _update_ib_coverage(
+    metadata: Dict[str, Any], frame: pd.DataFrame, requested_start: str,
+    existing_metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    coverage = dict(metadata.get("coverage") or {})
+    existing_coverage = (existing_metadata or {}).get("coverage") or {}
+    provider_heads = [
+        value for value in (
+            coverage.get("provider_head"), existing_coverage.get("provider_head")
+        ) if value
+    ]
+    provider_head = min(provider_heads) if provider_heads else None
+    if provider_head:
+        if metadata.get("time_semantics") == "calendar_date":
+            limited = dt.date.fromisoformat(str(provider_head)[:10]) > dt.date.fromisoformat(requested_start)
+        else:
+            timezone_id = metadata["ibkr"].get("timeZoneId") or "UTC"
+            requested = pd.Timestamp(
+                dt.datetime.combine(dt.date.fromisoformat(requested_start), dt.time.min, ZoneInfo(timezone_id))
+            ).tz_convert("UTC")
+            limited = pd.Timestamp(provider_head) > requested
+    else:
+        limited = False
+    coverage.update({
+        "status": "provider_limited" if limited else "complete",
+        "provider_head": provider_head,
+        "actual_start": _coverage_value(
+            frame.index.min(), metadata.get("time_semantics") == "calendar_date"
+        ),
+        "actual_end": _coverage_value(
+            frame.index.max(), metadata.get("time_semantics") == "calendar_date"
+        ),
+    })
+    metadata["coverage"] = coverage
+
+def _enforce_full_history(metadata: Dict[str, Any], required: bool) -> None:
+    if required and metadata.get("coverage", {}).get("status") == "provider_limited":
+        raise ValueError("PROVIDER_LIMITED: --require-full-history prevents dataset write")
+
+def _calendar_request_end(cursor: dt.date, timezone: ZoneInfo) -> dt.datetime:
+    return dt.datetime.combine(cursor, dt.time(23, 59, 59), timezone)
 
 def fetch_one_ibkr(
     ib: "IB", ticker: str, start: str, end: str, interval: str,
@@ -735,7 +795,9 @@ def fetch_one_ibkr(
         try:
             bars = _call_ib_with_retries(
                 lambda: ib.reqHistoricalData(
-                    contract, endDateTime=cursor, durationStr=chunk,
+                    contract, endDateTime=(
+                        _calendar_request_end(cursor, timezone) if calendar else cursor
+                    ), durationStr=chunk,
                     barSizeSetting=bar_size, whatToShow=what_to_show,
                     useRTH=use_rth, formatDate=format_date, timeout=60,
                 ), retries, sleep_sec, sleep_fn=getattr(ib, "sleep", None),
@@ -799,15 +861,65 @@ def fetch_one_ibkr(
     if df.empty:
         return ticker, None, "PERMANENT_NO_HISTORICAL_DATA: no bars in requested range", None
     metadata = _ib_metadata(
-        ticker, interval, adjust, start, end, contract, details, what_to_show, use_rth
+        ticker, interval, adjust, start, end, contract, details, what_to_show, use_rth,
+        known_head,
     )
+    _update_ib_coverage(metadata, df, start)
     return ticker, df, None, metadata
 
 class _MarketDataWrapper(Wrapper):
-    """Discard unavoidable handshake account IDs without caching or emitting."""
+    """Allow market-data responses and discard unsolicited sensitive state."""
 
     def managedAccounts(self, _accounts_list: str) -> None:
         return None
+
+    # TWS can send these without a collector request (for example when this
+    # client is accidentally configured as Master Client ID). Never retain or
+    # emit their payloads.
+    def updateAccountValue(self, *args) -> None: return None
+    def updateAccountTime(self, *args) -> None: return None
+    def accountSummary(self, *args) -> None: return None
+    def accountSummaryEnd(self, *args) -> None: return None
+    def updatePortfolio(self, *args) -> None: return None
+    def position(self, *args) -> None: return None
+    def positionEnd(self, *args) -> None: return None
+    def positionMulti(self, *args) -> None: return None
+    def positionMultiEnd(self, *args) -> None: return None
+    def accountUpdateMulti(self, *args) -> None: return None
+    def accountUpdateMultiEnd(self, *args) -> None: return None
+    def accountDownloadEnd(self, *args) -> None: return None
+    def openOrder(self, *args) -> None: return None
+    def openOrderEnd(self, *args) -> None: return None
+    def orderStatus(self, *args) -> None: return None
+    def orderBound(self, *args) -> None: return None
+    def completedOrder(self, *args) -> None: return None
+    def completedOrdersEnd(self, *args) -> None: return None
+    def execDetails(self, *args) -> None: return None
+    def execDetailsEnd(self, *args) -> None: return None
+    def commissionReport(self, *args) -> None: return None
+    def pnl(self, *args) -> None: return None
+    def pnlSingle(self, *args) -> None: return None
+
+    def contractDetails(self, reqId: int, contractDetails: Any) -> None:
+        results = self._results.get(reqId)
+        if results is not None:
+            results.append(contractDetails)
+
+    def contractDetailsEnd(self, reqId: int) -> None:
+        if reqId in self._futures:
+            self._endReq(reqId)
+
+    def error(
+        self, reqId: int, errorCode: int, errorString: str,
+        _advancedOrderRejectJson: str = "",
+    ) -> None:
+        # Do not call Wrapper.error: it logs the raw broker payload. Only active
+        # allowlisted requests receive a RequestError, and system connectivity
+        # state is handled without emitting the raw string.
+        if reqId in self._futures:
+            self._results.pop(reqId, None)
+            self._endReq(reqId, RequestError(reqId, errorCode, errorString), False)
+        self.ib._onError(reqId, errorCode, errorString, self._reqId2Contract.get(reqId))
 
 
 class _MarketDataIB(IB):
@@ -829,15 +941,61 @@ class _MarketDataIB(IB):
             await self.client.connectAsync(host, port, int(clientId), timeout)
             if not self.client.isReady():
                 raise ConnectionError("Socket connection broken while connecting")
+            self.client._accounts.clear()
+            self._assert_market_data_only_state()
             self.connectedEvent.emit()
         except BaseException:
             self.disconnect()
             raise
 
-    def _onError(self, _req_id, _error_code, _error_string, _contract) -> None:
-        # In particular, do not inherit IB._onError's code-1102 account-summary
-        # resubscription. Market-data requests are explicitly retried or failed.
-        return None
+    def _assert_market_data_only_state(self) -> None:
+        sensitive = {
+            "wrapper.accounts": self.wrapper.accounts,
+            "client._accounts": self.client._accounts,
+            "wrapper.accountValues": self.wrapper.accountValues,
+            "wrapper.acctSummary": self.wrapper.acctSummary,
+            "wrapper.portfolio": self.wrapper.portfolio,
+            "wrapper.positions": self.wrapper.positions,
+            "wrapper.trades": self.wrapper.trades,
+            "wrapper.fills": self.wrapper.fills,
+            "wrapper.reqId2PnL": self.wrapper.reqId2PnL,
+            "wrapper.reqId2PnlSingle": self.wrapper.reqId2PnlSingle,
+        }
+        retained = [name for name, value in sensitive.items() if value]
+        if retained:
+            raise RuntimeError(
+                "IBKR_MARKET_DATA_BOUNDARY: sensitive dependency state is not empty: "
+                + ", ".join(retained)
+            )
+
+    def _cleanup_request(self, req_id: int) -> None:
+        self.wrapper._futures.pop(req_id, None)
+        self.wrapper._results.pop(req_id, None)
+        self.wrapper._reqId2Contract.pop(req_id, None)
+
+    def _fail_active_requests(self, message: str) -> None:
+        for req_id in list(self.wrapper._futures):
+            self.wrapper._results.pop(req_id, None)
+            self.wrapper._endReq(req_id, ConnectionError(message), False)
+
+    def _onError(self, _req_id, error_code, _error_string, _contract) -> None:
+        if error_code == 1100:
+            self._fail_active_requests("IB/TWS upstream connectivity lost (1100)")
+        elif error_code == 1101:
+            self._fail_active_requests("IB/TWS connectivity restored; requests lost (1101)")
+        # 1102 means data maintained. Deliberately do not inherit IB._onError's
+        # account-summary resubscription and do not fail active market requests.
+
+    async def reqContractDetailsStrictAsync(
+        self, contract: "Contract", *, timeout: float,
+    ) -> Any:
+        req_id = self.client.getReqId()
+        future = self.wrapper.startReq(req_id, contract)
+        self.client.reqContractDetails(req_id, contract)
+        try:
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            self._cleanup_request(req_id)
 
     async def reqHistoricalDataStrictAsync(
         self, contract: "Contract", *, endDateTime: Any, durationStr: str,
@@ -865,8 +1023,9 @@ class _MarketDataIB(IB):
             await asyncio.wait_for(future, timeout)
         except asyncio.TimeoutError:
             self.client.cancelHistoricalData(req_id)
-            self.wrapper._endReq(req_id, success=False)
             raise
+        finally:
+            self._cleanup_request(req_id)
         return bars
 
     async def reqHeadTimeStampStrictAsync(
@@ -880,7 +1039,7 @@ class _MarketDataIB(IB):
             return await asyncio.wait_for(future, timeout)
         finally:
             self.client.cancelHeadTimeStamp(req_id)
-            self.wrapper._endReq(req_id, success=False)
+            self._cleanup_request(req_id)
 
 
 class MarketDataIBAdapter:
@@ -903,6 +1062,7 @@ class MarketDataIBAdapter:
         self._engine._run(
             self._engine.connectAsync(host, port, clientId=client_id, timeout=timeout)
         )
+        self._engine._assert_market_data_only_state()
         return self
 
     def disconnect(self) -> None:
@@ -914,8 +1074,10 @@ class MarketDataIBAdapter:
     def sleep(self, seconds: float) -> None:
         self._engine.sleep(seconds)
 
-    def reqContractDetails(self, contract: "Contract") -> Any:
-        return self._engine.reqContractDetails(contract)
+    def reqContractDetails(self, contract: "Contract", timeout: float = 30) -> Any:
+        return self._engine._run(
+            self._engine.reqContractDetailsStrictAsync(contract, timeout=timeout)
+        )
 
     def reqHeadTimeStamp(
         self, contract: "Contract", whatToShow: str, useRTH: bool, timeout: float = 30
@@ -934,7 +1096,9 @@ class MarketDataIBAdapter:
 
 def _clamp_ib_async_logging() -> None:
     for logger_name in ("ib_async.client", "ib_async.wrapper", "ib_async.ib"):
-        logging.getLogger(logger_name).setLevel(logging.WARNING)
+        dependency_logger = logging.getLogger(logger_name)
+        dependency_logger.disabled = True
+        dependency_logger.propagate = False
 
 
 def ib_connect(host: str, port: int, client_id: int) -> MarketDataIBAdapter:
@@ -996,6 +1160,8 @@ def parse_args() -> argparse.Namespace:
                    help="IBKR regular-hours policy. Default: true; use --no-ib-use-rth for extended hours.")
     p.add_argument("--ib-retries", type=int, default=2,
                    help="Bounded retries after an IBKR retryable failure. Default: 2")
+    p.add_argument("--require-full-history", action="store_true",
+                   help="IBKR: fail without writing when provider history starts after --start.")
     p.add_argument("--ib-rate-limit", type=float, default=2.0,
                    help="Max historical-data requests/sec to IBKR (separate from --rate-limit, "
                         "which only applies to yfinance). Default: 2.0")
@@ -1274,21 +1440,39 @@ def _run_with_source(args: argparse.Namespace, tickers: List[str],
             except ValueError as exc:
                 raise RuntimeError(f"PROVENANCE_FAILURE: {ticker}: {exc}") from exc
 
+        output_frame = df_new
+        write_suffix = ""
         if args.overwrite and os.path.exists(out_path):
-            save_frame_with_metadata(df_new, out_path, args.format, metadata)
-            log(f"[ok]  {ticker}: {len(df_new):>5} rows -> {out_path} (overwrote)")
-            successes += 1
+            write_suffix = " (overwrote)"
         elif args.append and os.path.exists(out_path):
             df_old = fetch_plan.get(ticker, (None, None))[1]
-            merged = align_and_merge(df_old, df_new) if df_old is not None else df_new
-            save_frame_with_metadata(merged, out_path, args.format, metadata)
-            added = len(merged) - (0 if df_old is None else len(df_old))
-            log(f"[ok]  {ticker}: {len(merged):>5} rows -> {out_path} (appended {max(0, added)} new rows)")
-            successes += 1
-        else:
-            save_frame_with_metadata(df_new, out_path, args.format, metadata)
-            log(f"[ok]  {ticker}: {len(df_new):>5} rows -> {out_path}")
-            successes += 1
+            output_frame = align_and_merge(df_old, df_new) if df_old is not None else df_new
+            added = len(output_frame) - (0 if df_old is None else len(df_old))
+            write_suffix = f" (appended {max(0, added)} new rows)"
+
+        if args.source == "ibkr":
+            _update_ib_coverage(
+                metadata, output_frame, args.start, provenance.get(ticker)
+            )
+            coverage = metadata["coverage"]
+            if coverage["status"] == "provider_limited":
+                message = (
+                    f"{ticker}: provider history begins at {coverage['provider_head']}, "
+                    f"after requested start {args.start}"
+                )
+                try:
+                    _enforce_full_history(
+                        metadata, getattr(args, "require_full_history", False)
+                    )
+                except ValueError:
+                    log(f"[err]  {message}; --require-full-history prevents write")
+                    failures.append((ticker, "PROVIDER_LIMITED"))
+                    continue
+                log(f"[warn] {message}; saving explicitly provider-limited dataset")
+
+        save_frame_with_metadata(output_frame, out_path, args.format, metadata)
+        log(f"[ok]  {ticker}: {len(output_frame):>5} rows -> {out_path}{write_suffix}")
+        successes += 1
 
     log(f"\nDone. {successes} succeeded, {len(failures)} failed, {len(skipped)} skipped.")
     if failures:

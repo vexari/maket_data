@@ -83,8 +83,9 @@ raising `--retries`.
 
 ### Alternative source: Interactive Brokers
 
-> **IBKR mode is historical MARKET DATA ONLY. It contains no trading or order
-> execution capability and is not approved as production-validated.**
+> **IBKR mode is historical MARKET DATA ONLY. The collector exposes no
+> application order-execution path and runs behind TWS/IB Gateway Read-Only
+> API enforcement. It is not approved as production-validated.**
 
 `--source ibkr` pulls bars from a running **TWS** or **IB Gateway** instance over its local API
 socket (via `ib_async`) instead of scraping Yahoo. This is your own broker connection, so it isn't
@@ -98,7 +99,8 @@ subject to Yahoo's rate-limiting, and it can reach some symbols/exchanges Yahoo 
   portfolio, position, order, execution, or PnL request. This code-side defense
   does not replace the gateway setting.
 - Prefer localhost or a tightly controlled trusted IP.
-- A dedicated, non-zero client ID.
+- A dedicated, non-zero client ID that **must not** be configured as the
+  TWS/IB Gateway Master Client ID.
 - Market data subscriptions for whatever exchanges you're requesting
 
 ```bash
@@ -115,6 +117,8 @@ python get_stock_data.py -i tickers.list --source ibkr --ib-port 7496
 - `--ib-use-rth` / `--no-ib-use-rth`: `true` (default) requests Regular
   Trading Hours only; `false` includes available extended-hours data.
 - `--ib-retries`: bounded retry count after retryable IBKR failures. Default: `2`.
+- `--require-full-history`: refuse to write an IBKR dataset when the provider's
+  earliest available timestamp is later than the requested start.
 - `--ib-rate-limit` : max historical-data requests/sec over the IB connection (separate from
   `--rate-limit`, which only applies to yfinance). Default: `2.0`
 - `--adjust` : with `--source ibkr`, requests split/dividend-adjusted bars (`ADJUSTED_LAST`)
@@ -142,7 +146,11 @@ history/ibkr/AAPL.csv.meta.json
 ```
 
 Every new or overwritten dataset has a mandatory provenance sidecar containing
-the data SHA-256, query semantics, and (for IBKR) resolved contract identity.
+the data SHA-256, query semantics, and (for IBKR) resolved contract identity and
+coverage status. `coverage.status=provider_limited` records that IBKR's head
+timestamp is later than the requested start, while `actual_start` and
+`actual_end` describe the complete saved dataset. Such data is saved with a
+warning unless `--require-full-history` is set.
 Append fails on missing/invalid metadata, changed source/ticker/interval/
 adjustment/RTH/what-to-show, changed `conId`, or a data hash mismatch. A legacy
 Yahoo file may still be skipped normally, but cannot be appended until one
@@ -161,13 +169,15 @@ in validation output.
 
 TWS necessarily sends managed-account identifiers during the initial API
 protocol handshake. The collector cannot prevent those bytes from arriving,
-but its wrapper immediately discards the callback: identifiers are not cached,
+but its client state and wrapper immediately clear/discard them after handshake
+readiness: identifiers are not cached beyond that readiness boundary,
 used by application logic, printed, logged, persisted, or included in
-validation/provenance output. Before connecting, the collector clamps
-`ib_async.client`, `ib_async.wrapper`, and `ib_async.ib` logging to `WARNING` to
-prevent INFO/DEBUG wire or state diagnostics from exposing handshake or broker
-state. Connectivity-restored code 1102 does not trigger account-summary
-resubscription.
+validation/provenance output. Unexpected account, portfolio, position, order,
+execution, commission, and PnL callbacks are dropped without caching or event
+emission. Before connecting, the collector disables output and propagation for
+`ib_async.client`, `ib_async.wrapper`, and `ib_async.ib`; errors are surfaced
+only through the collector's sanitized categories. Connectivity-restored code
+1102 does not trigger account-summary resubscription.
 
 Historical requests use collector-owned futures and timeouts. A timeout
 cancels the exact IBKR request and is classified `RETRYABLE_TIMEOUT`; it is not
